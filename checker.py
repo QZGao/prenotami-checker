@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-PrenotaMi Schengen Visa Slot Checker
+PrenotaMi Schengen Visa Slot Checker + Auto-Booker
 
 Monitors the Italian consulate's PrenotaMi appointment system for available
-Schengen visa slots and sends an email notification when one opens up.
-
-Configuration is done via environment variables or a .env file.
+Schengen visa slots. When a slot is found, it automatically books the
+earliest available appointment and sends a confirmation email.
 """
 
 import os
@@ -16,7 +15,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-# --- Configuration (from environment variables or .env file) ---
+# --- Configuration ---
 def load_env():
     """Load .env file if it exists."""
     env_file = Path(__file__).parent / ".env"
@@ -32,17 +31,14 @@ load_env()
 EMAIL = os.environ.get("PRENOTAMI_EMAIL", "")
 PASSWORD = os.environ.get("PRENOTAMI_PASSWORD", "")
 NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", EMAIL)
-# Check interval in seconds (default: 900 = 15 minutes)
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "900"))
-# Notification cooldown in seconds (default: 1800 = 30 minutes)
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))
 NOTIFY_COOLDOWN_SECONDS = int(os.environ.get("NOTIFY_COOLDOWN", "1800"))
-# Notification method: "macos_mail" or "smtp"
 NOTIFY_METHOD = os.environ.get("NOTIFY_METHOD", "macos_mail")
 
 LOG_DIR = Path(__file__).parent / "logs"
 COOLDOWN_FILE = Path(__file__).parent / ".last_notified"
+BOOKED_FILE = Path(__file__).parent / ".booked"
 
-# Set up logging
 LOG_DIR.mkdir(exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -56,16 +52,7 @@ log = logging.getLogger("prenotami")
 
 
 def send_email_notification(subject: str, body: str):
-    """Send an email notification. Uses macOS Mail.app by default."""
-    if NOTIFY_METHOD == "macos_mail":
-        _send_via_macos_mail(subject, body)
-    else:
-        log.warning(f"Unknown notification method: {NOTIFY_METHOD}. Email not sent.")
-
-
-def _send_via_macos_mail(subject: str, body: str):
-    """Send email via macOS Mail.app using osascript."""
-    # Escape quotes for AppleScript
+    """Send email via macOS Mail.app."""
     subject_escaped = subject.replace('"', '\\"')
     body_escaped = body.replace('"', '\\"')
     script = f'''
@@ -83,15 +70,14 @@ def _send_via_macos_mail(subject: str, body: str):
             capture_output=True, text=True, timeout=30
         )
         if result.returncode == 0:
-            log.info(f"Email notification sent to {NOTIFY_EMAIL}")
+            log.info(f"Email sent to {NOTIFY_EMAIL}")
         else:
-            log.error(f"Failed to send email: {result.stderr}")
+            log.error(f"Email failed: {result.stderr}")
     except Exception as e:
-        log.error(f"Email notification error: {e}")
+        log.error(f"Email error: {e}")
 
 
 def should_notify() -> bool:
-    """Check if we should send a notification (respecting cooldown)."""
     if not COOLDOWN_FILE.exists():
         return True
     try:
@@ -102,17 +88,192 @@ def should_notify() -> bool:
 
 
 def mark_notified():
-    """Record that we just sent a notification."""
     COOLDOWN_FILE.write_text(str(time.time()))
 
 
-def check_slots():
-    """Log into PrenotaMi and check for available Schengen visa slots."""
+def is_already_booked() -> bool:
+    """Check if we've already successfully booked."""
+    return BOOKED_FILE.exists()
+
+
+def mark_booked(details: str):
+    """Record that we successfully booked."""
+    BOOKED_FILE.write_text(f"{datetime.now().isoformat()}\n{details}")
+
+
+ALL_BOOKED_INDICATORS = [
+    "All appointments for this service are currently booked",
+    "tutti gli appuntamenti",
+    "currently booked",
+    "attualmente esauriti",
+    "posti disponibili per il servizio scelto sono esauriti",
+    "elevata richiesta",
+    "sono esauriti",
+]
+
+
+def attempt_auto_book(page) -> str:
+    """
+    When slots are available, attempt to book the earliest one.
+    Returns a description of what happened.
+    """
+    log.info("🎉 ATTEMPTING AUTO-BOOK...")
+    page.screenshot(path=str(LOG_DIR / "autobook_start.png"))
+
+    try:
+        # Wait for any calendar/form to load
+        time.sleep(3)
+        page.screenshot(path=str(LOG_DIR / "autobook_after_wait.png"))
+
+        # Look for a calendar with available dates
+        # PrenotaMi typically shows a calendar where available dates are clickable
+        page_content = page.content()
+
+        # Try to find and click available date cells
+        # Available dates usually have a specific class or are not grayed out
+        available_date = page.evaluate("""() => {
+            // Look for calendar cells that are clickable/available
+            const selectors = [
+                'td.day:not(.disabled):not(.old):not(.new)',
+                'td.active',
+                'td[data-action="selectDay"]:not(.disabled)',
+                '.datepicker td:not(.disabled):not(.old)',
+                'a.ui-state-default:not(.ui-state-disabled)',
+                '.fc-day:not(.fc-day-disabled)',
+                'td.giorno_disponibile',
+                'td.disponibile',
+                'td[style*="cursor: pointer"]',
+                '.day-content:not(.disabled)',
+            ];
+            for (const sel of selectors) {
+                const els = document.querySelectorAll(sel);
+                if (els.length > 0) {
+                    // Click the first available date
+                    els[0].click();
+                    return `Clicked date via: ${sel} (found ${els.length} options)`;
+                }
+            }
+            // Try any green/available-looking elements
+            const allTds = document.querySelectorAll('td');
+            for (const td of allTds) {
+                const style = window.getComputedStyle(td);
+                if (style.backgroundColor === 'rgb(0, 128, 0)' ||
+                    style.backgroundColor === 'green' ||
+                    td.classList.contains('available') ||
+                    td.classList.contains('free') ||
+                    (style.cursor === 'pointer' && !td.classList.contains('disabled'))) {
+                    td.click();
+                    return `Clicked available date cell`;
+                }
+            }
+            return null;
+        }""")
+
+        if available_date:
+            log.info(f"Date selection: {available_date}")
+        else:
+            log.info("No standard calendar found, looking for other booking UI elements...")
+
+        time.sleep(2)
+        page.screenshot(path=str(LOG_DIR / "autobook_after_date.png"))
+
+        # Look for time slots
+        time_slot = page.evaluate("""() => {
+            const selectors = [
+                'select[name*="time"] option:not(:disabled):not([value=""])',
+                'select[name*="ora"] option:not(:disabled):not([value=""])',
+                '.time-slot:not(.disabled)',
+                'input[type="radio"][name*="time"]',
+                'input[type="radio"][name*="ora"]',
+                'select option:not(:first-child)',
+            ];
+            for (const sel of selectors) {
+                const els = document.querySelectorAll(sel);
+                if (els.length > 0) {
+                    if (els[0].tagName === 'OPTION') {
+                        els[0].selected = true;
+                        els[0].parentElement.dispatchEvent(new Event('change', {bubbles: true}));
+                        return `Selected time: ${els[0].textContent.trim()}`;
+                    } else if (els[0].tagName === 'INPUT') {
+                        els[0].click();
+                        return `Clicked time radio: ${els[0].value}`;
+                    } else {
+                        els[0].click();
+                        return `Clicked time slot: ${els[0].textContent.trim()}`;
+                    }
+                }
+            }
+            return null;
+        }""")
+
+        if time_slot:
+            log.info(f"Time selection: {time_slot}")
+        
+        time.sleep(2)
+        page.screenshot(path=str(LOG_DIR / "autobook_after_time.png"))
+
+        # Look for a submit/confirm/book button
+        submit_clicked = page.evaluate("""() => {
+            const selectors = [
+                'button:not([disabled])',
+                'input[type="submit"]:not([disabled])',
+                'a.btn:not(.disabled)',
+            ];
+            const keywords = ['confirm', 'submit', 'book', 'prenota', 'conferma',
+                             'save', 'salva', 'avanti', 'next', 'proceed', 'invia'];
+            for (const sel of selectors) {
+                const els = document.querySelectorAll(sel);
+                for (const el of els) {
+                    const text = el.textContent.trim().toLowerCase();
+                    for (const kw of keywords) {
+                        if (text.includes(kw)) {
+                            el.click();
+                            return `Clicked: ${el.textContent.trim()}`;
+                        }
+                    }
+                }
+            }
+            return null;
+        }""")
+
+        if submit_clicked:
+            log.info(f"Submit: {submit_clicked}")
+            time.sleep(5)
+            page.screenshot(path=str(LOG_DIR / "autobook_after_submit.png"))
+
+            # Check for confirmation
+            final_content = page.content().lower()
+            if any(w in final_content for w in ['conferma', 'confirm', 'success', 'booked',
+                                                  'prenotazione', 'appointment', 'appuntamento']):
+                page.screenshot(path=str(LOG_DIR / "BOOKING_CONFIRMED.png"))
+                return f"BOOKING LIKELY CONFIRMED! {submit_clicked}"
+
+        # If we got here, take a final screenshot and return what we know
+        page.screenshot(path=str(LOG_DIR / "autobook_final_state.png"))
+        
+        # Get whatever text is on screen for the email
+        visible_text = page.evaluate("() => document.body.innerText.substring(0, 2000)")
+        return f"Booking attempted. Page state: {visible_text[:500]}"
+
+    except Exception as e:
+        log.error(f"Auto-book error: {e}")
+        try:
+            page.screenshot(path=str(LOG_DIR / "autobook_error.png"))
+        except:
+            pass
+        return f"Auto-book error: {e}"
+
+
+def check_and_book():
+    """Log into PrenotaMi, check for slots, and auto-book if available."""
     from playwright.sync_api import sync_playwright
 
+    if is_already_booked():
+        log.info("✅ Already booked! Skipping check. Delete .booked file to re-enable.")
+        return
+
     if not EMAIL or not PASSWORD:
-        log.error("PRENOTAMI_EMAIL and PRENOTAMI_PASSWORD must be set. "
-                  "Use environment variables or create a .env file.")
+        log.error("PRENOTAMI_EMAIL and PRENOTAMI_PASSWORD must be set.")
         sys.exit(1)
 
     log.info("Starting slot check...")
@@ -133,64 +294,29 @@ def check_slots():
             page.goto("https://prenotami.esteri.it/", timeout=30000)
             page.wait_for_load_state("networkidle", timeout=15000)
             time.sleep(2)
-            page.screenshot(path=str(LOG_DIR / "step1_homepage.png"))
 
-            # Step 2: Click the login button
-            log.info("Looking for login link...")
-            login_selectors = [
-                "a:has-text('EFFETTUARE IL LOGIN')",
-                "a:has-text('LOGIN')",
-                "a:has-text('Log in')",
-                "a:has-text('Accedi')",
-                "a[href*='Login']",
-                "a[href*='login']",
-                "button:has-text('LOGIN')",
-            ]
-            clicked = False
-            for sel in login_selectors:
+            # Step 2: Click login
+            log.info("Clicking login...")
+            for sel in ["a:has-text('EFFETTUARE IL LOGIN')", "a:has-text('LOG IN')",
+                        "a:has-text('Log in')", "a[href*='Login']"]:
                 try:
                     el = page.locator(sel).first
                     if el.is_visible(timeout=2000):
                         el.click()
-                        clicked = True
-                        log.info(f"Clicked login via: {sel}")
                         break
                 except:
                     continue
 
-            if not clicked:
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                time.sleep(1)
-                for sel in login_selectors:
-                    try:
-                        el = page.locator(sel).first
-                        if el.is_visible(timeout=2000):
-                            el.click()
-                            clicked = True
-                            log.info(f"Clicked login (after scroll) via: {sel}")
-                            break
-                    except:
-                        continue
-
-            if not clicked:
-                log.error("Could not find login link!")
-                page.screenshot(path=str(LOG_DIR / "no_login_link.png"))
-                return
-
-            # Wait for redirect to iam.esteri.it
             page.wait_for_load_state("networkidle", timeout=20000)
             time.sleep(3)
-            page.screenshot(path=str(LOG_DIR / "step2_login_page.png"))
-            log.info(f"Login page URL: {page.url}")
 
-            # Step 3: Fill in credentials
-            log.info("Filling login credentials...")
-            for sel in ["input#UserName", "input[name='UserName']", "input[type='text']", "input[type='email']"]:
+            # Step 3: Login
+            log.info("Logging in...")
+            for sel in ["input#UserName", "input[name='UserName']", "input[type='text']"]:
                 try:
                     el = page.locator(sel).first
                     if el.is_visible(timeout=3000):
                         el.fill(EMAIL)
-                        log.info(f"Filled username via: {sel}")
                         break
                 except:
                     continue
@@ -200,43 +326,38 @@ def check_slots():
                     el = page.locator(sel).first
                     if el.is_visible(timeout=3000):
                         el.fill(PASSWORD)
-                        log.info(f"Filled password via: {sel}")
                         break
                 except:
                     continue
 
-            for sel in ["button:has-text('Next')", "button:has-text('Sign in')", "button:has-text('Login')", "button[type='submit']"]:
+            for sel in ["button:has-text('Next')", "button:has-text('Sign in')", "button[type='submit']"]:
                 try:
                     el = page.locator(sel).first
                     if el.is_visible(timeout=2000):
                         el.click()
-                        log.info(f"Clicked submit via: {sel}")
                         break
                 except:
                     continue
 
             page.wait_for_load_state("networkidle", timeout=20000)
             time.sleep(5)
-            page.screenshot(path=str(LOG_DIR / "step3_after_login.png"))
 
-            # Check for login failure
             page_text = page.content().lower()
             if "login failure" in page_text or "login failed" in page_text:
-                log.error("Login failed! Check credentials.")
+                log.error("Login failed!")
                 page.screenshot(path=str(LOG_DIR / "login_failed.png"))
                 return
 
             log.info("Login successful!")
 
-            # Step 4: Navigate to services page
-            log.info("Navigating to booking page...")
+            # Step 4: Navigate to Services
+            log.info("Navigating to services...")
             page.goto("https://prenotami.esteri.it/Services", timeout=30000)
             page.wait_for_load_state("networkidle", timeout=15000)
             time.sleep(3)
-            page.screenshot(path=str(LOG_DIR / "step4_services.png"))
 
-            # Step 5: Find the Schengen Visa row and click PRENOTA/BOOK
-            log.info("Looking for Schengen visa booking...")
+            # Step 5: Click PRENOTA for Schengen visa
+            log.info("Clicking Schengen visa PRENOTA...")
             schengen_clicked = page.evaluate("""() => {
                 const rows = document.querySelectorAll('tr');
                 for (const row of rows) {
@@ -277,31 +398,21 @@ def check_slots():
                 }""")
 
             if not schengen_clicked:
-                log.warning("No Schengen visa PRENOTA button found")
-                page.screenshot(path=str(LOG_DIR / "no_schengen_button.png"))
+                log.warning("No Schengen PRENOTA button found")
+                page.screenshot(path=str(LOG_DIR / "no_schengen.png"))
                 return
 
             log.info("Clicked PRENOTA for Schengen visa")
             time.sleep(3)
 
-            # Step 6: Check if all booked or slots available
+            # Step 6: Check result
             page_content = page.content()
-            page.screenshot(path=str(LOG_DIR / "step5_after_book.png"))
+            page.screenshot(path=str(LOG_DIR / "after_prenota.png"))
 
-            all_booked_indicators = [
-                "All appointments for this service are currently booked",
-                "tutti gli appuntamenti",
-                "currently booked",
-                "attualmente esauriti",
-                "posti disponibili per il servizio scelto sono esauriti",
-                "elevata richiesta",
-                "sono esauriti",
-            ]
-
-            is_all_booked = any(ind in page_content for ind in all_booked_indicators)
+            is_all_booked = any(ind in page_content for ind in ALL_BOOKED_INDICATORS)
 
             if is_all_booked:
-                log.info("❌ No slots available - all appointments are currently booked.")
+                log.info("❌ No slots available - all booked.")
                 try:
                     ok_btn = page.locator("button:has-text('OK'), a:has-text('OK')").first
                     if ok_btn.is_visible(timeout=2000):
@@ -309,23 +420,29 @@ def check_slots():
                 except:
                     pass
             else:
-                log.info("🎉 SLOTS MAY BE AVAILABLE!")
-                page.screenshot(path=str(LOG_DIR / "slots_available.png"))
+                # 🎉 SLOTS AVAILABLE — AUTO-BOOK!
+                log.info("🎉🎉🎉 SLOTS DETECTED! ATTEMPTING AUTO-BOOK! 🎉🎉🎉")
+                result = attempt_auto_book(page)
+                log.info(f"Auto-book result: {result}")
 
-                if should_notify():
-                    send_email_notification(
-                        "PrenotaMi Schengen Visa Slot Available!",
-                        "A Schengen visa appointment slot appears to be available!\\n\\n"
-                        "Go book it NOW: https://prenotami.esteri.it/\\n\\n"
-                        f"Detected at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\\n\\n"
-                        "-- PrenotaMi Slot Checker"
-                    )
-                    mark_notified()
-                else:
-                    log.info("Notification cooldown active, skipping email.")
+                # Send notification regardless
+                send_email_notification(
+                    "PRENOTAMI: Schengen Visa Slot Detected & Booking Attempted!",
+                    f"A Schengen visa slot was detected at the Italian Consulate SF!\\n\\n"
+                    f"Auto-book result: {result}\\n\\n"
+                    f"IMPORTANT: Please check https://prenotami.esteri.it/ immediately "
+                    f"to verify the booking or grab the slot manually!\\n\\n"
+                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\\n\\n"
+                    f"-- PrenotaMi Auto-Booker"
+                )
+                mark_notified()
+
+                if "CONFIRMED" in result.upper():
+                    mark_booked(result)
+                    log.info("✅ BOOKING CONFIRMED! Stopping further checks.")
 
         except Exception as e:
-            log.error(f"Error during slot check: {e}")
+            log.error(f"Error: {e}")
             try:
                 page.screenshot(path=str(LOG_DIR / "error.png"))
             except:
@@ -333,21 +450,24 @@ def check_slots():
         finally:
             browser.close()
 
-    log.info("Slot check complete.")
+    log.info("Check complete.")
 
 
 def run_loop():
     """Run the checker in a loop."""
-    log.info(f"Starting checker loop (interval: {CHECK_INTERVAL}s)...")
+    log.info(f"Starting auto-book loop (interval: {CHECK_INTERVAL}s = {CHECK_INTERVAL//60} min)...")
     while True:
-        check_slots()
+        if is_already_booked():
+            log.info("✅ Already booked! Exiting loop.")
+            break
+        check_and_book()
         log.info(f"Next check in {CHECK_INTERVAL // 60} minutes...")
         time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="PrenotaMi Schengen Visa Slot Checker")
+    parser = argparse.ArgumentParser(description="PrenotaMi Schengen Visa Auto-Booker")
     parser.add_argument("--loop", action="store_true", help="Run in continuous loop mode")
     parser.add_argument("--once", action="store_true", help="Run a single check (default)")
     args = parser.parse_args()
@@ -355,4 +475,4 @@ if __name__ == "__main__":
     if args.loop:
         run_loop()
     else:
-        check_slots()
+        check_and_book()
