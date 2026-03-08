@@ -212,6 +212,24 @@ def attempt_auto_book(page) -> str:
         time.sleep(2)
         page.screenshot(path=str(LOG_DIR / "autobook_after_time.png"))
 
+        # Auto-fill common form fields if present (Name, Hotel, Dates, etc)
+        try:
+            page.evaluate("""() => {
+                const inputs = document.querySelectorAll('input[type="text"], textarea');
+                for (const input of inputs) {
+                    const name = (input.name || input.id || '').toLowerCase();
+                    if (name.includes('name') || name.includes('nome')) input.value = 'Angli';
+                    if (name.includes('surname') || name.includes('cognome')) input.value = 'Liu';
+                    if (name.includes('birth') || name.includes('nascita')) input.value = '27/05/1991';
+                    if (name.includes('hotel') || name.includes('address') || name.includes('indirizzo')) input.value = 'Hotel Nologo, Viale Sauli 5, 16121 Genoa, Italy';
+                    if (name.includes('flight') || name.includes('volo') || name.includes('date')) input.value = 'May 22, 2026 - June 09, 2026';
+                    if (name.includes('employer') || name.includes('lavoro')) input.value = 'Meta Platforms, Inc.';
+                    input.dispatchEvent(new Event('change', {bubbles: true}));
+                }
+            }""")
+        except Exception as e:
+            log.warning(f"Auto-fill warning: {e}")
+
         # Look for a submit/confirm/book button
         submit_clicked = page.evaluate("""() => {
             const selectors = [
@@ -287,6 +305,9 @@ def check_and_book():
             viewport={"width": 1280, "height": 800},
         )
         page = context.new_page()
+        
+        # Handle Facebook password reuse and any other JS alerts automatically
+        page.on("dialog", lambda dialog: dialog.accept())
 
         try:
             # Step 1: Navigate to PrenotaMi
@@ -426,12 +447,25 @@ def check_and_book():
                 log.info(f"Auto-book result: {result}")
 
                 # Send notification regardless
+                travel_info = (
+                    "--- TRAVEL DETAILS FOR BOOKING ---\\n"
+                    "Name: Angli Liu\\n"
+                    "DOB: May 27, 1991\\n"
+                    "Citizenship: China\\n"
+                    "Passport Key Info: Issued Feb 11, 2022; Expires Feb 10, 2032\\n"
+                    "Employer: Meta Platforms, Inc. (Machine Learning Engineer)\\n"
+                    "Trip Dates: May 22, 2026 - June 09, 2026\\n"
+                    "Hotel: Hotel Nologo (Viale Sauli 5, 16121 Genoa, Italy)\\n"
+                    "U.S. Status: H1B, pending I-485, Advance Parole\\n"
+                    "---------------------------------\\n\\n"
+                )
                 send_email_notification(
                     "PRENOTAMI: Schengen Visa Slot Detected & Booking Attempted!",
                     f"A Schengen visa slot was detected at the Italian Consulate SF!\\n\\n"
                     f"Auto-book result: {result}\\n\\n"
                     f"IMPORTANT: Please check https://prenotami.esteri.it/ immediately "
                     f"to verify the booking or grab the slot manually!\\n\\n"
+                    f"{travel_info}"
                     f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\\n\\n"
                     f"-- PrenotaMi Auto-Booker"
                 )
