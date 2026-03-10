@@ -215,6 +215,7 @@ def attempt_auto_book(page) -> str:
         # Auto-fill common form fields if present (Name, Hotel, Dates, etc)
         try:
             page.evaluate("""() => {
+                // Handle text inputs and textareas
                 const inputs = document.querySelectorAll('input[type="text"], textarea');
                 for (const input of inputs) {
                     const name = (input.name || input.id || '').toLowerCase();
@@ -225,6 +226,44 @@ def attempt_auto_book(page) -> str:
                     if (name.includes('flight') || name.includes('volo') || name.includes('date')) input.value = 'May 22, 2026 - June 09, 2026';
                     if (name.includes('employer') || name.includes('lavoro')) input.value = 'Meta Platforms, Inc.';
                     input.dispatchEvent(new Event('change', {bubbles: true}));
+                }
+                
+                // Handle dropdowns / selects (like "Tipo Prenotazione")
+                const selects = document.querySelectorAll('select');
+                for (const select of selects) {
+                    const name = (select.name || select.id || '').toLowerCase();
+                    let bestOption = null;
+                    
+                    for (let i = 0; i < select.options.length; i++) {
+                        const optText = select.options[i].text.toLowerCase();
+                        const optVal = select.options[i].value.toLowerCase();
+                        // Ignore empty/placeholder options
+                        if (!optVal || optVal === '0' || optText.includes('seleziona')) continue;
+                        
+                        // Default to the first valid option we find
+                        if (!bestOption) bestOption = select.options[i];
+                        
+                        // Prefer specific values if it's booking type
+                        if (name.includes('tipo') || name.includes('type')) {
+                            if (optText.includes('singol') || optText.includes('ordinar')) {
+                                bestOption = select.options[i];
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (bestOption) {
+                        select.value = bestOption.value;
+                        select.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                }
+                
+                // Handle checkboxes (like Terms & Privacy)
+                const checkboxes = document.querySelectorAll('input[type="checkbox"]');
+                for (const cb of checkboxes) {
+                    if (!cb.checked) {
+                        cb.click();
+                    }
                 }
             }""")
         except Exception as e:
