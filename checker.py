@@ -112,6 +112,15 @@ ALL_BOOKED_INDICATORS = [
 ]
 
 
+def check_page_for_all_booked(page) -> bool:
+    """Check if the current page shows an 'all booked' message."""
+    try:
+        content = page.content()
+        return any(ind in content for ind in ALL_BOOKED_INDICATORS)
+    except:
+        return False
+
+
 def attempt_auto_book(page) -> str:
     """
     When slots are available, attempt to book the earliest one.
@@ -123,6 +132,19 @@ def attempt_auto_book(page) -> str:
     try:
         # Wait for any calendar/form to load
         time.sleep(3)
+
+        # CRITICAL: Re-check for 'all booked' popup that may have appeared late
+        if check_page_for_all_booked(page):
+            log.info("❌ FALSE ALARM: 'all booked' popup appeared after delay. Aborting auto-book.")
+            page.screenshot(path=str(LOG_DIR / "autobook_false_alarm.png"))
+            try:
+                ok_btn = page.locator("button:has-text('OK'), a:has-text('OK')").first
+                if ok_btn.is_visible(timeout=2000):
+                    ok_btn.click()
+            except:
+                pass
+            return "FALSE_ALARM: all booked popup appeared after initial check"
+
         page.screenshot(path=str(LOG_DIR / "autobook_after_wait.png"))
 
         # Look for a calendar with available dates
@@ -270,6 +292,12 @@ def attempt_auto_book(page) -> str:
             log.warning(f"Auto-fill warning: {e}")
 
         # Look for a submit/confirm/book button
+        # Re-check AGAIN before submitting — popups can appear at any time
+        if check_page_for_all_booked(page):
+            log.info("❌ FALSE ALARM at submit stage: 'all booked' popup appeared.")
+            page.screenshot(path=str(LOG_DIR / "autobook_false_alarm_submit.png"))
+            return "FALSE_ALARM: all booked popup appeared before submit"
+
         submit_clicked = page.evaluate("""() => {
             const selectors = [
                 'button:not([disabled])',
@@ -298,12 +326,27 @@ def attempt_auto_book(page) -> str:
             time.sleep(5)
             page.screenshot(path=str(LOG_DIR / "autobook_after_submit.png"))
 
-            # Check for confirmation
+            # Check for 'all booked' popup AGAIN after submit
+            if check_page_for_all_booked(page):
+                log.info("❌ FALSE ALARM after submit: still no real slots.")
+                page.screenshot(path=str(LOG_DIR / "autobook_false_alarm_after_submit.png"))
+                return "FALSE_ALARM: all booked popup appeared after submit"
+
+            # Check for REAL confirmation — must see specific booking success indicators
             final_content = page.content().lower()
-            if any(w in final_content for w in ['conferma', 'confirm', 'success', 'booked',
-                                                  'prenotazione', 'appointment', 'appuntamento']):
+            strong_confirm = ['prenotazione effettuata', 'booking confirmed',
+                             'appuntamento confermato', 'successfully booked',
+                             'conferma prenotazione', 'your appointment']
+            if any(w in final_content for w in strong_confirm):
                 page.screenshot(path=str(LOG_DIR / "BOOKING_CONFIRMED.png"))
-                return f"BOOKING LIKELY CONFIRMED! {submit_clicked}"
+                return f"BOOKING CONFIRMED! {submit_clicked}"
+            
+            # Weaker indicators — booking MAY have worked but needs verification
+            weak_confirm = ['calendario', 'calendar', 'data e ora', 'date and time',
+                           'i miei appuntamenti']
+            if any(w in final_content for w in weak_confirm):
+                page.screenshot(path=str(LOG_DIR / "BOOKING_MAYBE_CONFIRMED.png"))
+                return f"BOOKING_MAYBE: Reached calendar/date page. {submit_clicked}"
 
         # If we got here, take a final screenshot and return what we know
         page.screenshot(path=str(LOG_DIR / "autobook_final_state.png"))
@@ -463,13 +506,19 @@ def check_and_book():
                 return
 
             log.info("Clicked PRENOTA for Schengen visa")
-            time.sleep(3)
+            # Wait LONGER for any popup to fully render (was 3s, now 6s)
+            time.sleep(6)
 
-            # Step 6: Check result
+            # Step 6: Check result — do TWO checks with a gap
             page_content = page.content()
             page.screenshot(path=str(LOG_DIR / "after_prenota.png"))
-
             is_all_booked = any(ind in page_content for ind in ALL_BOOKED_INDICATORS)
+
+            # If not detected yet, wait a bit more and check again
+            if not is_all_booked:
+                time.sleep(3)
+                page_content2 = page.content()
+                is_all_booked = any(ind in page_content2 for ind in ALL_BOOKED_INDICATORS)
 
             if is_all_booked:
                 log.info("❌ No slots available - all booked.")
@@ -498,19 +547,23 @@ def check_and_book():
                     "U.S. Status: H1B, pending I-485, Advance Parole\\n"
                     "---------------------------------\\n\\n"
                 )
-                send_email_notification(
-                    "PRENOTAMI: Schengen Visa Slot Detected & Booking Attempted!",
-                    f"A Schengen visa slot was detected at the Italian Consulate SF!\\n\\n"
-                    f"Auto-book result: {result}\\n\\n"
-                    f"IMPORTANT: Please check https://prenotami.esteri.it/ immediately "
-                    f"to verify the booking or grab the slot manually!\\n\\n"
-                    f"{travel_info}"
-                    f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\\n\\n"
-                    f"-- PrenotaMi Auto-Booker"
-                )
-                mark_notified()
+                # Only send email and mark booked for REAL detections, not false alarms
+                if "FALSE_ALARM" in result.upper():
+                    log.info("False alarm detected — NOT marking as booked, continuing checks.")
+                else:
+                    send_email_notification(
+                        "PRENOTAMI: Schengen Visa Slot Detected & Booking Attempted!",
+                        f"A Schengen visa slot was detected at the Italian Consulate SF!\\n\\n"
+                        f"Auto-book result: {result}\\n\\n"
+                        f"IMPORTANT: Please check https://prenotami.esteri.it/ immediately "
+                        f"to verify the booking or grab the slot manually!\\n\\n"
+                        f"{travel_info}"
+                        f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\\n\\n"
+                        f"-- PrenotaMi Auto-Booker"
+                    )
+                    mark_notified()
 
-                if "CONFIRMED" in result.upper():
+                if "BOOKING CONFIRMED" in result.upper() or "BOOKING_MAYBE" in result.upper():
                     mark_booked(result)
                     log.info("✅ BOOKING CONFIRMED! Stopping further checks.")
 
