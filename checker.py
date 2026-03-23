@@ -234,53 +234,84 @@ def attempt_auto_book(page) -> str:
         time.sleep(2)
         page.screenshot(path=str(LOG_DIR / "autobook_after_time.png"))
 
-        # Auto-fill common form fields if present (Name, Hotel, Dates, etc)
+        # Auto-fill the EXACT PrenotaMi booking form fields
         try:
             page.evaluate("""() => {
-                // Handle text inputs and textareas
-                const inputs = document.querySelectorAll('input[type="text"], textarea');
-                for (const input of inputs) {
-                    const name = (input.name || input.id || '').toLowerCase();
-                    if (name.includes('name') || name.includes('nome')) input.value = 'Angli';
-                    if (name.includes('surname') || name.includes('cognome')) input.value = 'Liu';
-                    if (name.includes('birth') || name.includes('nascita')) input.value = '27/05/1991';
-                    if (name.includes('hotel') || name.includes('address') || name.includes('indirizzo')) input.value = 'Hotel Nologo, Viale Sauli 5, 16121 Genoa, Italy';
-                    if (name.includes('flight') || name.includes('volo') || name.includes('date')) input.value = 'May 22, 2026 - June 09, 2026';
-                    if (name.includes('employer') || name.includes('lavoro')) input.value = 'Meta Platforms, Inc.';
-                    input.dispatchEvent(new Event('change', {bubbles: true}));
-                }
-                
-                // Handle dropdowns / selects (like "Tipo Prenotazione")
+                // === DROPDOWNS (must be set FIRST as they may reveal other fields) ===
                 const selects = document.querySelectorAll('select');
                 for (const select of selects) {
+                    const label = (select.previousElementSibling?.textContent || '').toLowerCase();
                     const name = (select.name || select.id || '').toLowerCase();
-                    let bestOption = null;
+                    const combined = label + ' ' + name;
                     
-                    for (let i = 0; i < select.options.length; i++) {
-                        const optText = select.options[i].text.toLowerCase();
-                        const optVal = select.options[i].value.toLowerCase();
-                        // Ignore empty/placeholder options
-                        if (!optVal || optVal === '0' || optText.includes('seleziona')) continue;
-                        
-                        // Default to the first valid option we find
-                        if (!bestOption) bestOption = select.options[i];
-                        
-                        // Prefer specific values if it's booking type
-                        if (name.includes('tipo') || name.includes('type')) {
-                            if (optText.includes('singol') || optText.includes('ordinar')) {
-                                bestOption = select.options[i];
+                    // Tipo Prenotazione -> Prenotazione Singola
+                    if (combined.includes('tipo prenotazione') || combined.includes('tipo_prenotazione')) {
+                        for (let i = 0; i < select.options.length; i++) {
+                            if (select.options[i].text.toLowerCase().includes('singol')) {
+                                select.value = select.options[i].value;
                                 break;
                             }
                         }
                     }
-                    
-                    if (bestOption) {
-                        select.value = bestOption.value;
-                        select.dispatchEvent(new Event('change', {bubbles: true}));
+                    // Tipo di passaporto -> ordinario
+                    else if (combined.includes('passaporto')) {
+                        for (let i = 0; i < select.options.length; i++) {
+                            if (select.options[i].text.toLowerCase().includes('ordinar')) {
+                                select.value = select.options[i].value;
+                                break;
+                            }
+                        }
                     }
+                    // Motivo soggiorno -> Turismo (NOT Affari!)
+                    else if (combined.includes('motivo') || combined.includes('soggiorno')) {
+                        for (let i = 0; i < select.options.length; i++) {
+                            if (select.options[i].text.toLowerCase().includes('turism')) {
+                                select.value = select.options[i].value;
+                                break;
+                            }
+                        }
+                    }
+                    // Any other dropdown: pick first non-empty option
+                    else {
+                        for (let i = 0; i < select.options.length; i++) {
+                            const v = select.options[i].value;
+                            if (v && v !== '0' && !select.options[i].text.toLowerCase().includes('seleziona')) {
+                                select.value = v;
+                                break;
+                            }
+                        }
+                    }
+                    select.dispatchEvent(new Event('change', {bubbles: true}));
                 }
                 
-                // Handle checkboxes (like Terms & Privacy)
+                // === TEXT INPUTS ===
+                const inputs = document.querySelectorAll('input[type="text"], textarea');
+                for (const input of inputs) {
+                    const label = (input.previousElementSibling?.textContent || '').toLowerCase();
+                    const name = (input.name || input.id || input.placeholder || '').toLowerCase();
+                    const combined = label + ' ' + name;
+                    
+                    // Indirizzo completo di residenza (mandatory!)
+                    if (combined.includes('indirizzo') || combined.includes('residenza') || combined.includes('address')) {
+                        input.value = '61 McLellan Ave, San Mateo, CA 94403, USA';
+                    }
+                    // Note per la sede
+                    else if (combined.includes('note') || combined.includes('sede')) {
+                        input.value = 'Schengen visa application for tourism. Trip: May 22 - June 9, 2026. Hotel Nologo, Genoa.';
+                    }
+                    // Generic name fields
+                    else if (combined.includes('nome') && !combined.includes('cognome')) {
+                        input.value = 'Angli';
+                    }
+                    else if (combined.includes('cognome') || combined.includes('surname')) {
+                        input.value = 'Liu';
+                    }
+                    
+                    input.dispatchEvent(new Event('input', {bubbles: true}));
+                    input.dispatchEvent(new Event('change', {bubbles: true}));
+                }
+                
+                // === CHECKBOXES (Privacy / Terms) ===
                 const checkboxes = document.querySelectorAll('input[type="checkbox"]');
                 for (const cb of checkboxes) {
                     if (!cb.checked) {
@@ -288,8 +319,12 @@ def attempt_auto_book(page) -> str:
                     }
                 }
             }""")
+            log.info("Auto-fill completed for PrenotaMi form fields")
         except Exception as e:
             log.warning(f"Auto-fill warning: {e}")
+        
+        time.sleep(1)
+        page.screenshot(path=str(LOG_DIR / "autobook_after_fill.png"))
 
         # Look for a submit/confirm/book button
         # Re-check AGAIN before submitting — popups can appear at any time
