@@ -50,31 +50,60 @@ logging.basicConfig(
 )
 log = logging.getLogger("prenotami")
 
+NOTIFICATION_LOG = LOG_DIR / "notifications.log"
+
 
 def send_email_notification(subject: str, body: str):
-    """Send email via macOS Mail.app."""
-    subject_escaped = subject.replace('"', '\\"')
-    body_escaped = body.replace('"', '\\"')
-    script = f'''
-    tell application "Mail"
-        set newMessage to make new outgoing message with properties {{subject:"{subject_escaped}", content:"{body_escaped}", visible:false}}
-        tell newMessage
-            make new to recipient at end of to recipients with properties {{address:"{NOTIFY_EMAIL}"}}
-        end tell
-        send newMessage
-    end tell
-    '''
+    """Send notification via macOS alert + log file + say command."""
+    clean_body = body.replace("\\\\n", "\n").replace("\\n", "\n")
+
+    # 1. Write to notification log file (always works)
     try:
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode == 0:
-            log.info(f"Email sent to {NOTIFY_EMAIL}")
-        else:
-            log.error(f"Email failed: {result.stderr}")
+        with open(NOTIFICATION_LOG, "a") as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"TIME: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"SUBJECT: {subject}\n")
+            f.write(f"BODY:\n{clean_body}\n")
+            f.write(f"{'='*60}\n")
+        log.info(f"Notification logged to {NOTIFICATION_LOG}")
     except Exception as e:
-        log.error(f"Email error: {e}")
+        log.error(f"Failed to write notification log: {e}")
+
+    # 2. macOS display notification
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{subject}" with title "PrenotaMi Alert" sound name "Glass"'],
+            capture_output=True, timeout=10
+        )
+        log.info("macOS notification sent")
+    except Exception as e:
+        log.warning(f"macOS notification failed: {e}")
+
+    # 3. Say it aloud so user hears it
+    try:
+        subprocess.Popen(["say", "PrenotaMi slot detected! Check the booking!"])
+    except Exception:
+        pass
+
+    # 4. Try Gmail SMTP as best-effort (may fail)
+    gmail_password = os.environ.get("GMAIL_APP_PASSWORD", "")
+    if gmail_password:
+        try:
+            import smtplib
+            from email.mime.text import MIMEText
+            msg = MIMEText(clean_body)
+            msg["Subject"] = subject
+            msg["From"] = EMAIL
+            msg["To"] = NOTIFY_EMAIL
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
+                server.login(EMAIL, gmail_password)
+                server.sendmail(EMAIL, [NOTIFY_EMAIL], msg.as_string())
+            log.info(f"Email sent to {NOTIFY_EMAIL} via Gmail SMTP")
+        except Exception as e:
+            log.warning(f"Gmail SMTP failed (non-critical): {e}")
+    else:
+        log.info("GMAIL_APP_PASSWORD not set — skipping email, using log + macOS notify")
 
 
 def should_notify() -> bool:
@@ -235,75 +264,90 @@ def attempt_auto_book(page) -> str:
         page.screenshot(path=str(LOG_DIR / "autobook_after_time.png"))
 
         # Auto-fill the EXACT PrenotaMi booking form fields
+        # Use a robust label-finding approach: walk ALL text on the page near each element
         try:
             page.evaluate("""() => {
-                // === DROPDOWNS (must be set FIRST as they may reveal other fields) ===
-                const selects = document.querySelectorAll('select');
-                for (const select of selects) {
-                    const label = (select.previousElementSibling?.textContent || '').toLowerCase();
-                    const name = (select.name || select.id || '').toLowerCase();
-                    const combined = label + ' ' + name;
-                    
-                    // Tipo Prenotazione -> Prenotazione Singola
-                    if (combined.includes('tipo prenotazione') || combined.includes('tipo_prenotazione')) {
-                        for (let i = 0; i < select.options.length; i++) {
-                            if (select.options[i].text.toLowerCase().includes('singol')) {
-                                select.value = select.options[i].value;
-                                break;
-                            }
-                        }
+                // Helper: find the label text for a form element by searching parent, siblings, 
+                // associated <label>, and nearby text nodes
+                function getLabelText(el) {
+                    // Check for <label for="id">
+                    if (el.id) {
+                        const lbl = document.querySelector('label[for="' + el.id + '"]');
+                        if (lbl) return lbl.textContent.toLowerCase();
                     }
-                    // Tipo di passaporto -> ordinario
-                    else if (combined.includes('passaporto')) {
-                        for (let i = 0; i < select.options.length; i++) {
-                            if (select.options[i].text.toLowerCase().includes('ordinar')) {
-                                select.value = select.options[i].value;
-                                break;
-                            }
-                        }
+                    // Check closest label parent
+                    const parentLabel = el.closest('label');
+                    if (parentLabel) return parentLabel.textContent.toLowerCase();
+                    // Check previous siblings and parent's previous siblings
+                    let node = el.previousElementSibling;
+                    while (node) {
+                        const txt = node.textContent.trim();
+                        if (txt.length > 0 && txt.length < 100) return txt.toLowerCase();
+                        node = node.previousElementSibling;
                     }
-                    // Motivo soggiorno -> Turismo (NOT Affari!)
-                    else if (combined.includes('motivo') || combined.includes('soggiorno')) {
-                        for (let i = 0; i < select.options.length; i++) {
-                            if (select.options[i].text.toLowerCase().includes('turism')) {
-                                select.value = select.options[i].value;
-                                break;
-                            }
-                        }
+                    // Check parent's text before this element
+                    const parent = el.parentElement;
+                    if (parent) {
+                        const prevSib = parent.previousElementSibling;
+                        if (prevSib) return prevSib.textContent.toLowerCase();
                     }
-                    // Any other dropdown: pick first non-empty option
-                    else {
-                        for (let i = 0; i < select.options.length; i++) {
-                            const v = select.options[i].value;
-                            if (v && v !== '0' && !select.options[i].text.toLowerCase().includes('seleziona')) {
-                                select.value = v;
-                                break;
-                            }
-                        }
-                    }
-                    select.dispatchEvent(new Event('change', {bubbles: true}));
+                    return '';
                 }
                 
-                // === TEXT INPUTS ===
+                // Helper: select an option by text match
+                function selectOption(sel, textMatch) {
+                    for (let i = 0; i < sel.options.length; i++) {
+                        if (sel.options[i].text.toLowerCase().includes(textMatch)) {
+                            sel.value = sel.options[i].value;
+                            sel.dispatchEvent(new Event('change', {bubbles: true}));
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                
+                // === DROPDOWNS ===
+                const selects = document.querySelectorAll('select');
+                for (const select of selects) {
+                    const label = getLabelText(select);
+                    const name = (select.name || select.id || '').toLowerCase();
+                    const all = label + ' ' + name;
+                    console.log('SELECT label:', all, 'options:', Array.from(select.options).map(o=>o.text));
+                    
+                    if (all.includes('tipo') && all.includes('prenot')) {
+                        selectOption(select, 'singol');
+                    } else if (all.includes('passaporto')) {
+                        selectOption(select, 'ordinar');
+                    } else if (all.includes('motivo') || all.includes('soggiorno')) {
+                        selectOption(select, 'turism');
+                    } else {
+                        // Pick first non-empty option
+                        for (let i = 0; i < select.options.length; i++) {
+                            const v = select.options[i].value;
+                            if (v && v !== '0' && !select.options[i].text.toLowerCase().includes('selezion')) {
+                                select.value = v;
+                                select.dispatchEvent(new Event('change', {bubbles: true}));
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // === TEXT INPUTS & TEXTAREAS ===
                 const inputs = document.querySelectorAll('input[type="text"], textarea');
                 for (const input of inputs) {
-                    const label = (input.previousElementSibling?.textContent || '').toLowerCase();
+                    const label = getLabelText(input);
                     const name = (input.name || input.id || input.placeholder || '').toLowerCase();
-                    const combined = label + ' ' + name;
+                    const all = label + ' ' + name;
+                    console.log('INPUT label:', all);
                     
-                    // Indirizzo completo di residenza (mandatory!)
-                    if (combined.includes('indirizzo') || combined.includes('residenza') || combined.includes('address')) {
+                    if (all.includes('indirizzo') || all.includes('residenza') || all.includes('address')) {
                         input.value = '61 McLellan Ave, San Mateo, CA 94403, USA';
-                    }
-                    // Note per la sede
-                    else if (combined.includes('note') || combined.includes('sede')) {
-                        input.value = 'Schengen visa application for tourism. Trip: May 22 - June 9, 2026. Hotel Nologo, Genoa.';
-                    }
-                    // Generic name fields
-                    else if (combined.includes('nome') && !combined.includes('cognome')) {
+                    } else if (all.includes('note') || input.tagName === 'TEXTAREA') {
+                        input.value = 'Schengen visa for tourism. Trip: May 22 - June 9, 2026. Hotel Nologo, Genoa.';
+                    } else if (all.includes('nome') && !all.includes('cognome')) {
                         input.value = 'Angli';
-                    }
-                    else if (combined.includes('cognome') || combined.includes('surname')) {
+                    } else if (all.includes('cognome') || all.includes('surname')) {
                         input.value = 'Liu';
                     }
                     
@@ -314,9 +358,7 @@ def attempt_auto_book(page) -> str:
                 // === CHECKBOXES (Privacy / Terms) ===
                 const checkboxes = document.querySelectorAll('input[type="checkbox"]');
                 for (const cb of checkboxes) {
-                    if (!cb.checked) {
-                        cb.click();
-                    }
+                    if (!cb.checked) cb.click();
                 }
             }""")
             log.info("Auto-fill completed for PrenotaMi form fields")
@@ -598,9 +640,11 @@ def check_and_book():
                     )
                     mark_notified()
 
-                if "BOOKING CONFIRMED" in result.upper() or "BOOKING_MAYBE" in result.upper():
+                if "BOOKING CONFIRMED" in result.upper():
                     mark_booked(result)
                     log.info("✅ BOOKING CONFIRMED! Stopping further checks.")
+                elif "BOOKING_MAYBE" in result.upper():
+                    log.info("⚠️ BOOKING_MAYBE: Not confirmed yet. Will keep checking.")
 
         except Exception as e:
             log.error(f"Error: {e}")
