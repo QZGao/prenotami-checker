@@ -471,8 +471,8 @@ def check_and_book():
         try:
             # Step 1: Navigate to PrenotaMi
             log.info("Navigating to PrenotaMi...")
-            page.goto("https://prenotami.esteri.it/", timeout=30000)
-            page.wait_for_load_state("networkidle", timeout=15000)
+            page.goto("https://prenotami.esteri.it/", timeout=60000)
+            page.wait_for_load_state("networkidle", timeout=45000)
             time.sleep(2)
 
             # Step 2: Click login
@@ -487,7 +487,7 @@ def check_and_book():
                 except:
                     continue
 
-            page.wait_for_load_state("networkidle", timeout=20000)
+            page.wait_for_load_state("networkidle", timeout=45000)
             time.sleep(3)
 
             # Step 3: Login
@@ -519,7 +519,7 @@ def check_and_book():
                 except:
                     continue
 
-            page.wait_for_load_state("networkidle", timeout=20000)
+            page.wait_for_load_state("networkidle", timeout=45000)
             time.sleep(5)
 
             page_text = page.content().lower()
