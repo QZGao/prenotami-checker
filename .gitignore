@@ -11,6 +11,10 @@ logs/
 .last_notified
 .runner.pid
 nohup.out
+.state.json
+.telegram_offset
+.browser-profile/
+.booked
 
 # Python
 __pycache__/

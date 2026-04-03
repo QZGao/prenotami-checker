@@ -1,0 +1,1 @@
+"""PrenotaMi checker package."""
