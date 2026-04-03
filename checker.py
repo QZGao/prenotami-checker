@@ -4,16 +4,16 @@ PrenotaMi Schengen Visa Slot Checker + Auto-Booker
 
 Monitors the Italian consulate's PrenotaMi appointment system for available
 Schengen visa slots. When a slot is found, it automatically books the
-earliest available appointment and sends a confirmation email.
+earliest available appointment and sends a Telegram alert.
 """
 
 import os
 import sys
-import subprocess
 import logging
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib import parse, request
 
 # --- Configuration ---
 def load_env():
@@ -30,10 +30,10 @@ load_env()
 
 EMAIL = os.environ.get("PRENOTAMI_EMAIL", "")
 PASSWORD = os.environ.get("PRENOTAMI_PASSWORD", "")
-NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", EMAIL)
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))
 NOTIFY_COOLDOWN_SECONDS = int(os.environ.get("NOTIFY_COOLDOWN", "1800"))
-NOTIFY_METHOD = os.environ.get("NOTIFY_METHOD", "macos_mail")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 LOG_DIR = Path(__file__).parent / "logs"
 COOLDOWN_FILE = Path(__file__).parent / ".last_notified"
@@ -53,8 +53,26 @@ log = logging.getLogger("prenotami")
 NOTIFICATION_LOG = LOG_DIR / "notifications.log"
 
 
-def send_email_notification(subject: str, body: str):
-    """Send notification via macOS alert + log file + say command."""
+def chunk_message(text: str, max_length: int = 4000) -> list[str]:
+    """Split long Telegram messages without breaking lines when possible."""
+    chunks = []
+    remaining = text
+
+    while len(remaining) > max_length:
+        split_at = remaining.rfind("\n", 0, max_length)
+        if split_at <= 0:
+            split_at = max_length
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:].lstrip("\n")
+
+    if remaining:
+        chunks.append(remaining)
+
+    return chunks
+
+
+def send_telegram_notification(subject: str, body: str):
+    """Send notification via Telegram bot + local log file."""
     clean_body = body.replace("\\\\n", "\n").replace("\\n", "\n")
 
     # 1. Write to notification log file (always works)
@@ -69,41 +87,31 @@ def send_email_notification(subject: str, body: str):
     except Exception as e:
         log.error(f"Failed to write notification log: {e}")
 
-    # 2. macOS display notification
+    # 2. Send Telegram bot notification
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram notification skipped: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set.")
+        return
+
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    full_message = f"{subject}\n\n{clean_body}"
+    message_chunks = chunk_message(full_message)
+
     try:
-        subprocess.run(
-            ["osascript", "-e",
-             f'display notification "{subject}" with title "PrenotaMi Alert" sound name "Glass"'],
-            capture_output=True, timeout=10
-        )
-        log.info("macOS notification sent")
+        total = len(message_chunks)
+        for index, chunk in enumerate(message_chunks, start=1):
+            text = chunk if total == 1 else f"[{index}/{total}]\n{chunk}"
+            payload = parse.urlencode({
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "disable_web_page_preview": "true",
+            }).encode("utf-8")
+            req = request.Request(api_url, data=payload, method="POST")
+            with request.urlopen(req, timeout=15) as response:
+                response.read()
+
+        log.info(f"Telegram notification sent to chat {TELEGRAM_CHAT_ID}")
     except Exception as e:
-        log.warning(f"macOS notification failed: {e}")
-
-    # 3. Say it aloud so user hears it
-    try:
-        subprocess.Popen(["say", "PrenotaMi slot detected! Check the booking!"])
-    except Exception:
-        pass
-
-    # 4. Try Gmail SMTP as best-effort (may fail)
-    gmail_password = os.environ.get("GMAIL_APP_PASSWORD", "")
-    if gmail_password:
-        try:
-            import smtplib
-            from email.mime.text import MIMEText
-            msg = MIMEText(clean_body)
-            msg["Subject"] = subject
-            msg["From"] = EMAIL
-            msg["To"] = NOTIFY_EMAIL
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
-                server.login(EMAIL, gmail_password)
-                server.sendmail(EMAIL, [NOTIFY_EMAIL], msg.as_string())
-            log.info(f"Email sent to {NOTIFY_EMAIL} via Gmail SMTP")
-        except Exception as e:
-            log.warning(f"Gmail SMTP failed (non-critical): {e}")
-    else:
-        log.info("GMAIL_APP_PASSWORD not set — skipping email, using log + macOS notify")
+        log.warning(f"Telegram notification failed: {e}")
 
 
 def should_notify() -> bool:
@@ -428,7 +436,7 @@ def attempt_auto_book(page) -> str:
         # If we got here, take a final screenshot and return what we know
         page.screenshot(path=str(LOG_DIR / "autobook_final_state.png"))
         
-        # Get whatever text is on screen for the email
+        # Get whatever text is on screen for the notification
         visible_text = page.evaluate("() => document.body.innerText.substring(0, 2000)")
         return f"Booking attempted. Page state: {visible_text[:500]}"
 
@@ -624,11 +632,11 @@ def check_and_book():
                     "U.S. Status: H1B, pending I-485, Advance Parole\\n"
                     "---------------------------------\\n\\n"
                 )
-                # Only send email and mark booked for REAL detections, not false alarms
+                # Only send a notification and mark booked for REAL detections, not false alarms
                 if "FALSE_ALARM" in result.upper():
                     log.info("False alarm detected — NOT marking as booked, continuing checks.")
                 else:
-                    send_email_notification(
+                    send_telegram_notification(
                         "PRENOTAMI: Schengen Visa Slot Detected & Booking Attempted!",
                         f"A Schengen visa slot was detected at the Italian Consulate SF!\\n\\n"
                         f"Auto-book result: {result}\\n\\n"
