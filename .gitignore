@@ -3,6 +3,7 @@
 
 # Virtual environment
 venv/
+.venv/
 
 # Logs and screenshots
 logs/

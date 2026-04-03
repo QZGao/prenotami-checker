@@ -59,7 +59,20 @@ MANUAL_SOLVE_URL=https://your-server.example.com:6080/vnc.html
 MANUAL_SOLVE_NOTE=Open the VNC session, solve the challenge in the existing browser window, then send /resume on Telegram.
 TELEGRAM_POLL_TIMEOUT=15
 PLAYWRIGHT_NO_SANDBOX=false
+BROWSER_WIDTH=1280
+BROWSER_HEIGHT=800
+BROWSER_LOCALE=en-US
+BROWSER_TIMEZONE=America/Los_Angeles
+DEFAULT_TIMEOUT_MS=20000
 ```
+
+Additional optional browser/runtime config supported by code:
+
+- `BROWSER_WIDTH` and `BROWSER_HEIGHT` control the viewport size
+- `BROWSER_LOCALE` controls Playwright locale
+- `BROWSER_TIMEZONE` controls Playwright timezone
+- `BROWSER_USER_AGENT` overrides the default browser user agent
+- `DEFAULT_TIMEOUT_MS` controls the Playwright default timeout
 
 ## Telegram Commands
 
@@ -101,6 +114,16 @@ python checker.py
 source .venv/bin/activate
 python checker.py --loop
 ```
+
+### Wrapper scripts
+
+```bash
+./run_checker.sh
+./run_loop.sh
+```
+
+The wrappers now look for `.venv/` first and fall back to `venv/`.
+`run_loop.sh` delegates to `python checker.py --loop` so `CHECK_INTERVAL` is respected by the Python runtime rather than duplicated in shell.
 
 ## Ubuntu + systemd
 

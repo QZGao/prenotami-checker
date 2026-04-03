@@ -1,6 +1,6 @@
 #!/bin/bash
 # PrenotaMi Slot Checker - Background Runner
-# Runs the checker every 15 minutes in the background.
+# Runs the Python loop mode in the background.
 #
 # Usage:
 #   Start: nohup ./run_loop.sh &
@@ -14,13 +14,18 @@ cd "$SCRIPT_DIR"
 echo $$ > .runner.pid
 
 echo "[$(date)] PrenotaMi checker loop started (PID: $$)"
-echo "[$(date)] Checking every 15 minutes..."
+echo "[$(date)] Starting python checker loop..."
 echo "[$(date)] To stop: kill $(cat .runner.pid)"
 
-while true; do
-    echo "[$(date)] Running check..."
+if [ -f ".venv/bin/activate" ]; then
+    # shellcheck disable=SC1091
+    source .venv/bin/activate
+elif [ -f "venv/bin/activate" ]; then
+    # shellcheck disable=SC1091
     source venv/bin/activate
-    python3 checker.py
-    echo "[$(date)] Next check in 15 minutes..."
-    sleep 900
-done
+else
+    echo "Virtual environment not found. Expected .venv/ or venv/." >&2
+    exit 1
+fi
+
+python3 checker.py --loop
