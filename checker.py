@@ -158,6 +158,45 @@ def check_page_for_all_booked(page) -> bool:
         return False
 
 
+def wait_for_first_visible(page, selectors: list[str], timeout: int = 15000) -> str | None:
+    """Return the first selector that becomes visible within the timeout."""
+    for sel in selectors:
+        try:
+            page.locator(sel).first.wait_for(state="visible", timeout=timeout)
+            return sel
+        except:
+            continue
+    return None
+
+
+def wait_for_page_ready(page, selectors: list[str] | None = None,
+                        timeout: int = 20000, settle_seconds: float = 1.0) -> str | None:
+    """
+    Wait for DOM readiness instead of network-idle.
+    PrenotaMi keeps background activity open often enough that network-idle is brittle.
+    """
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=timeout)
+    except Exception as e:
+        log.warning(f"DOM content load wait timed out on {page.url}: {e}")
+
+    matched_selector = None
+    if selectors:
+        matched_selector = wait_for_first_visible(page, selectors, timeout=timeout)
+        if matched_selector:
+            log.info(f"Page ready via selector: {matched_selector}")
+        else:
+            log.warning(f"None of the expected selectors became visible on {page.url}")
+    else:
+        try:
+            page.locator("body").first.wait_for(state="attached", timeout=timeout)
+        except Exception as e:
+            log.warning(f"Body did not attach on {page.url}: {e}")
+
+    time.sleep(settle_seconds)
+    return matched_selector
+
+
 def attempt_auto_book(page) -> str:
     """
     When slots are available, attempt to book the earliest one.
@@ -479,9 +518,21 @@ def check_and_book():
         try:
             # Step 1: Navigate to PrenotaMi
             log.info("Navigating to PrenotaMi...")
-            page.goto("https://prenotami.esteri.it/", timeout=60000)
-            page.wait_for_load_state("networkidle", timeout=45000)
-            time.sleep(2)
+            page.goto("https://prenotami.esteri.it/", wait_until="domcontentloaded", timeout=60000)
+            login_selector = wait_for_page_ready(
+                page,
+                selectors=[
+                    "a:has-text('EFFETTUARE IL LOGIN')",
+                    "a:has-text('LOG IN')",
+                    "a:has-text('Log in')",
+                    "a[href*='Login']",
+                ],
+                timeout=20000,
+                settle_seconds=2,
+            )
+            if not login_selector:
+                page.screenshot(path=str(LOG_DIR / "homepage_not_ready.png"))
+                raise RuntimeError(f"Homepage loaded but login link was not found at {page.url}")
 
             # Step 2: Click login
             log.info("Clicking login...")
@@ -495,8 +546,20 @@ def check_and_book():
                 except:
                     continue
 
-            page.wait_for_load_state("networkidle", timeout=45000)
-            time.sleep(3)
+            login_form_selector = wait_for_page_ready(
+                page,
+                selectors=[
+                    "input#UserName",
+                    "input[name='UserName']",
+                    "input#Password",
+                    "input[name='Password']",
+                ],
+                timeout=20000,
+                settle_seconds=2,
+            )
+            if not login_form_selector:
+                page.screenshot(path=str(LOG_DIR / "login_form_not_ready.png"))
+                raise RuntimeError(f"Login page loaded but credentials form was not found at {page.url}")
 
             # Step 3: Login
             log.info("Logging in...")
@@ -527,8 +590,16 @@ def check_and_book():
                 except:
                     continue
 
-            page.wait_for_load_state("networkidle", timeout=45000)
-            time.sleep(5)
+            wait_for_page_ready(
+                page,
+                selectors=[
+                    "a[href*='Logout']",
+                    "a[href*='Services']",
+                    "body",
+                ],
+                timeout=20000,
+                settle_seconds=3,
+            )
 
             page_text = page.content().lower()
             if "login failure" in page_text or "login failed" in page_text:
@@ -540,9 +611,17 @@ def check_and_book():
 
             # Step 4: Navigate to Services
             log.info("Navigating to services...")
-            page.goto("https://prenotami.esteri.it/Services", timeout=30000)
-            page.wait_for_load_state("networkidle", timeout=15000)
-            time.sleep(3)
+            page.goto("https://prenotami.esteri.it/Services", wait_until="domcontentloaded", timeout=30000)
+            wait_for_page_ready(
+                page,
+                selectors=[
+                    "tr",
+                    "table",
+                    "text=Schengen",
+                ],
+                timeout=15000,
+                settle_seconds=2,
+            )
 
             # Step 5: Click PRENOTA for Schengen visa
             log.info("Clicking Schengen visa PRENOTA...")
