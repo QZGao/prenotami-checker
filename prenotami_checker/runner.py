@@ -67,6 +67,17 @@ KNOWN_PAGE_STATES = {
     PAGE_STATE_PRENOTAMI_OTHER,
 }
 
+PAGE_STATE_PRIORITY = {
+    PAGE_STATE_CHALLENGE: 70,
+    PAGE_STATE_BOOKING: 60,
+    PAGE_STATE_SERVICES: 50,
+    PAGE_STATE_AUTHENTICATED: 40,
+    PAGE_STATE_SSO_LOGIN: 30,
+    PAGE_STATE_HOME_LOGGED_OUT: 20,
+    PAGE_STATE_PRENOTAMI_OTHER: 10,
+    PAGE_STATE_UNKNOWN: 0,
+}
+
 
 def is_already_booked(booked_file: Path) -> bool:
     return booked_file.exists()
@@ -129,6 +140,9 @@ class PrenotamiRunner:
             pass
         return (0, 0)
 
+    def _state_priority(self, state: str) -> int:
+        return PAGE_STATE_PRIORITY.get(state, 0)
+
     def focus_page(self, page) -> None:
         if not page:
             return
@@ -158,14 +172,43 @@ class PrenotamiRunner:
         self._attach_page_handlers(self.page)
         self.focus_page(self.page)
 
+    def _enumerate_page_states(self, probe_timeout: int = 400) -> list[tuple[int, str, object]]:
+        entries: list[tuple[int, str, object]] = []
+        for index, page in enumerate(self._open_pages()):
+            try:
+                state = self.classify_page_state(page, probe_timeout=probe_timeout)
+            except Exception:
+                state = PAGE_STATE_UNKNOWN
+            entries.append((index, state, page))
+        return entries
+
+    def _select_best_page(
+        self,
+        expected_states: set[str] | None = None,
+        probe_timeout: int = 400,
+    ) -> tuple[str, object] | None:
+        entries = self._enumerate_page_states(probe_timeout=probe_timeout)
+        if expected_states is not None:
+            entries = [entry for entry in entries if entry[1] in expected_states]
+        if not entries:
+            return None
+
+        _index, state, page = max(entries, key=lambda entry: (self._state_priority(entry[1]), entry[0]))
+        self._track_page(page)
+        return state, page
+
     def current_page(self, create: bool = True):
         if not self.context:
             return None
 
         pages = self._open_pages()
         if pages:
-            preferred = max(enumerate(pages), key=lambda item: (self._page_sort_key(item[1]), item[0]))[1]
-            self._track_page(preferred)
+            best = self._select_best_page(probe_timeout=200)
+            if best:
+                _state, preferred = best
+            else:
+                preferred = max(enumerate(pages), key=lambda item: (self._page_sort_key(item[1]), item[0]))[1]
+                self._track_page(preferred)
         elif create:
             self.page = self.context.new_page()
             self._track_page(self.page)
@@ -239,35 +282,32 @@ class PrenotamiRunner:
         seen_states: list[str] = []
 
         while time.time() < deadline:
-            pages = self._open_pages()
-            if not pages:
+            entries = self._enumerate_page_states(probe_timeout=probe_timeout)
+            if not entries:
                 time.sleep(0.2)
                 continue
 
-            for page in reversed(pages):
+            for _index, state, page in entries:
                 try:
-                    state = self.classify_page_state(page, probe_timeout=probe_timeout)
                     current_url = page.url
-                    stamp = f"{state}:{current_url}"
-                    if current_url and stamp not in seen_states:
-                        seen_states.append(stamp)
-                        if len(seen_states) > 10:
-                            seen_states = seen_states[-10:]
+                except Exception:
+                    current_url = ""
+                stamp = f"{state}:{current_url}"
+                if current_url and stamp not in seen_states:
+                    seen_states.append(stamp)
+                    if len(seen_states) > 10:
+                        seen_states = seen_states[-10:]
 
-                    if state not in expected:
-                        continue
-
-                    try:
-                        page.wait_for_load_state("domcontentloaded", timeout=1000)
-                    except Exception:
-                        pass
-
-                    self._track_page(page)
-                    if settle_seconds:
-                        time.sleep(settle_seconds)
-                    return state, page
+            selected = self._select_best_page(expected_states=expected, probe_timeout=probe_timeout)
+            if selected:
+                state, page = selected
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=1000)
                 except Exception:
                     pass
+                if settle_seconds:
+                    time.sleep(settle_seconds)
+                return state, page
 
             time.sleep(0.2)
 
@@ -339,13 +379,21 @@ class PrenotamiRunner:
         return True
 
     def current_action_page(self, stage: str, probe_timeout: int = 500) -> tuple[str, object]:
-        page = self.current_page(create=True)
-        state = self.classify_page_state(page, probe_timeout=probe_timeout)
+        selected = self._select_best_page(probe_timeout=probe_timeout)
+        if selected:
+            state, page = selected
+        else:
+            page = self.current_page(create=True)
+            state = self.classify_page_state(page, probe_timeout=probe_timeout)
         if state == PAGE_STATE_CHALLENGE:
             indicator = detect_bot_challenge(page) or page.url
             self.pause_for_challenge(stage, indicator)
-            page = self.current_page(create=True)
-            state = self.classify_page_state(page, probe_timeout=probe_timeout)
+            selected = self._select_best_page(probe_timeout=probe_timeout)
+            if selected:
+                state, page = selected
+            else:
+                page = self.current_page(create=True)
+                state = self.classify_page_state(page, probe_timeout=probe_timeout)
         return state, page
 
     def click_visible_on_current_page(
