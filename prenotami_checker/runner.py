@@ -325,6 +325,15 @@ class PrenotamiRunner:
         )
         return True
 
+    def _recover_from_sso_state_change(self, stage: str) -> bool:
+        page = self.current_page(create=True)
+        state = self.classify_page_state(page, probe_timeout=500)
+        if state == PAGE_STATE_SSO_LOGIN:
+            return False
+
+        log.info("SSO page changed to %s during %s (%s)", state, stage, page.url)
+        return True
+
     def save_state(self, mode: str, **extra: object) -> None:
         page = self.current_page(create=False)
         state = {
@@ -654,13 +663,19 @@ class PrenotamiRunner:
             if state == PAGE_STATE_SSO_LOGIN:
                 log.info("Submitting SSO login...")
                 if not fill_first_visible(page, USERNAME_SELECTORS, self.config.email, timeout=1000):
+                    if self._recover_from_sso_state_change("username lookup"):
+                        continue
                     raise RuntimeError("Username input was not found on the login page.")
 
                 if not fill_first_visible(page, PASSWORD_SELECTORS, self.config.password, timeout=1000):
+                    if self._recover_from_sso_state_change("password lookup"):
+                        continue
                     raise RuntimeError("Password input was not found on the login page.")
 
                 submit_clicked = click_first_visible(page, LOGIN_SUBMIT_SELECTORS, timeout=2000)
                 if not submit_clicked:
+                    if self._recover_from_sso_state_change("submit lookup"):
+                        continue
                     raise RuntimeError("Login submit button was not found.")
 
                 login_transition_started = True
