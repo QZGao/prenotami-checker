@@ -22,12 +22,14 @@ from .prenotami import (
     URL_STATE_CHALLENGE,
     URL_STATE_PRENOTAMI,
     URL_STATE_SSO,
+    URL_STATE_UNKNOWN,
     attempt_auto_book,
+    classify_page_url,
     click_first_visible,
     detect_bot_challenge,
+    fill_first_visible,
     wait_for_first_visible,
     wait_for_page_ready,
-    wait_for_url_state,
 )
 from .telegram_api import TelegramClient, write_notification_log
 
@@ -75,22 +77,110 @@ class PrenotamiRunner:
     def current_display(self) -> str:
         return os.environ.get("DISPLAY", "")
 
-    def current_page(self, create: bool = True):
-        if self.page and not self.page.is_closed():
-            return self.page
+    def _attach_page_handlers(self, page) -> None:
+        if getattr(page, "_prenotami_dialog_handler", False):
+            return
+        page.on("dialog", lambda dialog: dialog.accept())
+        setattr(page, "_prenotami_dialog_handler", True)
 
+    def _page_sort_key(self, page) -> tuple[int, int]:
+        try:
+            state = classify_page_url(page.url)
+            if state != URL_STATE_UNKNOWN:
+                return (2, 0)
+            if page.url and page.url != "about:blank":
+                return (1, 0)
+        except Exception:
+            pass
+        return (0, 0)
+
+    def focus_page(self, page) -> None:
+        if not page:
+            return
+        try:
+            page.bring_to_front()
+        except Exception:
+            return
+        try:
+            page.evaluate("() => window.focus()")
+        except Exception:
+            pass
+
+    def current_page(self, create: bool = True):
         if not self.context:
             return None
 
         pages = [page for page in self.context.pages if not page.is_closed()]
         if pages:
-            self.page = pages[-1]
+            preferred = max(enumerate(pages), key=lambda item: (self._page_sort_key(item[1]), item[0]))[1]
+            if preferred is not self.page:
+                previous_url = getattr(self.page, "url", "") if self.page else ""
+                new_url = getattr(preferred, "url", "")
+                if new_url != previous_url:
+                    log.info("Switching tracked browser page to %s", new_url or "(blank)")
+                self.page = preferred
+                self._attach_page_handlers(self.page)
+                self.focus_page(self.page)
         elif create:
             self.page = self.context.new_page()
-            self.page.on("dialog", lambda dialog: dialog.accept())
+            self._attach_page_handlers(self.page)
+            self.focus_page(self.page)
         else:
             self.page = None
         return self.page
+
+    def wait_for_route(
+        self,
+        expected_states: list[str] | tuple[str, ...],
+        timeout: int = 30000,
+        selectors_by_state: dict[str, list[str]] | None = None,
+        settle_seconds: float = 0.0,
+    ) -> tuple[str, object]:
+        deadline = time.time() + (timeout / 1000)
+        seen_urls: list[str] = []
+
+        while time.time() < deadline:
+            page = self.current_page(create=False)
+            if not page:
+                time.sleep(0.2)
+                continue
+
+            try:
+                current_url = page.url
+                state = classify_page_url(current_url)
+                if current_url and (not seen_urls or seen_urls[-1] != current_url):
+                    seen_urls.append(current_url)
+                    if len(seen_urls) > 5:
+                        seen_urls = seen_urls[-5:]
+
+                if state in expected_states:
+                    selectors = (selectors_by_state or {}).get(state)
+                    if selectors:
+                        remaining_ms = max(200, int((deadline - time.time()) * 1000))
+                        if wait_for_first_visible(page, selectors, timeout=min(remaining_ms, 800)):
+                            if settle_seconds:
+                                time.sleep(settle_seconds)
+                            return state, page
+                    else:
+                        try:
+                            page.wait_for_load_state("domcontentloaded", timeout=1000)
+                        except Exception:
+                            pass
+                        if settle_seconds:
+                            time.sleep(settle_seconds)
+                        return state, page
+            except Exception:
+                pass
+
+            time.sleep(0.2)
+
+        page = self.current_page(create=False)
+        trail = " -> ".join(seen_urls) if seen_urls else "(no navigable URL observed)"
+        current_url = page.url if page else "(unknown)"
+        raise RuntimeError(
+            f"Timed out waiting for route {list(expected_states)}. "
+            f"Current URL: {current_url}. Recent URLs: {trail}"
+        )
 
     def save_state(self, mode: str, **extra: object) -> None:
         page = self.current_page(create=False)
@@ -225,7 +315,6 @@ class PrenotamiRunner:
             )
             self.context.set_default_timeout(self.config.default_timeout_ms)
             self.page = self.current_page(create=True)
-            self.page.on("dialog", lambda dialog: dialog.accept())
         except Exception as exc:
             self.close_browser()
             raise RuntimeError(
@@ -237,6 +326,7 @@ class PrenotamiRunner:
             ) from exc
 
         self.save_state("running", message="Browser started")
+        self.focus_page(self.page)
         log.info(
             "Browser started with persistent profile %s (headless=%s)",
             self.config.browser_profile_dir,
@@ -356,27 +446,28 @@ class PrenotamiRunner:
 
     def ensure_logged_in(self) -> None:
         page = self.current_page(create=True)
+        self.focus_page(page)
         self.save_state("running", step="homepage")
 
         log.info("Navigating to PrenotaMi...")
         page.goto("https://prenotami.esteri.it/", wait_until="domcontentloaded", timeout=60000)
-        route = wait_for_url_state(
-            page,
+        route, page = self.wait_for_route(
             expected_states=[URL_STATE_PRENOTAMI, URL_STATE_SSO, URL_STATE_CHALLENGE],
             timeout=120000,
-            settle_seconds=2,
+            settle_seconds=0.5,
         )
         self.safe_point(f"landing:{route}")
+        page = self.current_page(create=True)
 
         if route == URL_STATE_PRENOTAMI:
             wait_for_page_ready(
                 page,
                 selectors=LOGIN_LINK_SELECTORS + LOGGED_IN_SELECTORS + ["body"],
                 timeout=20000,
-                settle_seconds=2,
+                settle_seconds=0.5,
             )
 
-            if wait_for_first_visible(page, LOGGED_IN_SELECTORS, timeout=1500):
+            if wait_for_first_visible(page, LOGGED_IN_SELECTORS, timeout=500):
                 log.info("Existing authenticated session detected.")
                 return
 
@@ -386,44 +477,23 @@ class PrenotamiRunner:
                 shot = self.capture_page("homepage_not_ready")
                 raise RuntimeError(f"Homepage loaded but login link was not found at {page.url}. Screenshot: {shot}")
 
-            route = wait_for_url_state(
-                page,
+            route, page = self.wait_for_route(
                 expected_states=[URL_STATE_SSO, URL_STATE_CHALLENGE],
+                selectors_by_state={URL_STATE_SSO: USERNAME_SELECTORS + PASSWORD_SELECTORS},
                 timeout=30000,
-                settle_seconds=2,
+                settle_seconds=0.0,
             )
             self.safe_point(f"after-login-click:{route}")
+            page = self.current_page(create=True)
 
         if route != URL_STATE_SSO:
             raise RuntimeError(f"Expected SSO login page but reached {page.url}")
-
-        wait_for_page_ready(page, selectors=USERNAME_SELECTORS + PASSWORD_SELECTORS + ["body"], timeout=20000, settle_seconds=2)
         self.safe_point("sso-login-page")
 
-        username_filled = False
-        for selector in USERNAME_SELECTORS:
-            try:
-                element = page.locator(selector).first
-                if element.is_visible(timeout=3000):
-                    element.fill(self.config.email)
-                    username_filled = True
-                    break
-            except Exception:
-                continue
-        if not username_filled:
+        if not fill_first_visible(page, USERNAME_SELECTORS, self.config.email, timeout=1000):
             raise RuntimeError("Username input was not found on the login page.")
 
-        password_filled = False
-        for selector in PASSWORD_SELECTORS:
-            try:
-                element = page.locator(selector).first
-                if element.is_visible(timeout=3000):
-                    element.fill(self.config.password)
-                    password_filled = True
-                    break
-            except Exception:
-                continue
-        if not password_filled:
+        if not fill_first_visible(page, PASSWORD_SELECTORS, self.config.password, timeout=1000):
             raise RuntimeError("Password input was not found on the login page.")
 
         submit_clicked = click_first_visible(page, LOGIN_SUBMIT_SELECTORS, timeout=2000)
@@ -431,13 +501,13 @@ class PrenotamiRunner:
             raise RuntimeError("Login submit button was not found.")
 
         try:
-            route = wait_for_url_state(
-                page,
+            route, page = self.wait_for_route(
                 expected_states=[URL_STATE_PRENOTAMI, URL_STATE_CHALLENGE],
                 timeout=120000,
-                settle_seconds=3,
+                settle_seconds=0.5,
             )
         except RuntimeError:
+            page = self.current_page(create=True)
             current_url = page.url
             shot = self.capture_page("post_login_timeout")
             raise RuntimeError(
@@ -447,7 +517,7 @@ class PrenotamiRunner:
         self.safe_point(f"post-login:{route}")
 
         if route == URL_STATE_PRENOTAMI:
-            wait_for_page_ready(page, selectors=LOGGED_IN_SELECTORS + ["body"], timeout=20000, settle_seconds=2)
+            wait_for_page_ready(page, selectors=LOGGED_IN_SELECTORS + ["body"], timeout=20000, settle_seconds=0.5)
             log.info("Login reached PrenotaMi.")
             return
 
@@ -516,20 +586,20 @@ class PrenotamiRunner:
         self.safe_point("after-login")
 
         page = self.current_page(create=True)
+        self.focus_page(page)
         self.save_state("running", step="services")
 
         log.info("Navigating to services...")
         page.goto("https://prenotami.esteri.it/Services", wait_until="domcontentloaded", timeout=30000)
-        route = wait_for_url_state(
-            page,
+        route, page = self.wait_for_route(
             expected_states=[URL_STATE_PRENOTAMI, URL_STATE_SSO, URL_STATE_CHALLENGE],
             timeout=60000,
-            settle_seconds=2,
+            settle_seconds=0.5,
         )
         self.safe_point(f"services:{route}")
         if route != URL_STATE_PRENOTAMI:
             raise RuntimeError(f"Services navigation did not stay on PrenotaMi. Current URL: {page.url}")
-        wait_for_page_ready(page, selectors=["#advanced", "tr", "table", "text=Schengen", "body"], timeout=20000, settle_seconds=2)
+        wait_for_page_ready(page, selectors=["#advanced", "tr", "table", "text=Schengen", "body"], timeout=20000, settle_seconds=0.5)
 
         log.info("Clicking Schengen visa PRENOTA...")
         if not self.click_schengen_prenota():

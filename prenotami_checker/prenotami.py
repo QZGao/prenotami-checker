@@ -40,16 +40,16 @@ LOGGED_IN_SELECTORS = [
 ]
 
 USERNAME_SELECTORS = [
+    "input#floatingLabelInput33",
     "input#UserName",
     "input[name='UserName']",
-    "input#floatingLabelInput33",
     "input[type='text']",
 ]
 
 PASSWORD_SELECTORS = [
+    "input#floatingLabelInput38",
     "input#Password",
     "input[name='Password']",
-    "input#floatingLabelInput38",
     "input[type='password']",
 ]
 
@@ -147,28 +147,89 @@ def wait_for_url_state(
     )
 
 
-def wait_for_first_visible(page, selectors: list[str], timeout: int = 15000) -> str | None:
-    """Return the first selector that becomes visible within the timeout."""
-    for selector in selectors:
+def wait_for_route_ready(
+    page,
+    expected_states: list[str] | tuple[str, ...],
+    selectors_by_state: dict[str, list[str]] | None = None,
+    timeout: int = 30000,
+    settle_seconds: float = 0.0,
+) -> str:
+    """Wait for an expected URL state and, if requested, for that state's selectors to be usable."""
+    deadline = time.time() + (timeout / 1000)
+    seen_urls: list[str] = []
+
+    while time.time() < deadline:
         try:
-            page.locator(selector).first.wait_for(state="visible", timeout=timeout)
-            return selector
+            current_url = page.url
+            state = classify_page_url(current_url)
+            if current_url and (not seen_urls or seen_urls[-1] != current_url):
+                seen_urls.append(current_url)
+                if len(seen_urls) > 5:
+                    seen_urls = seen_urls[-5:]
+
+            if state in expected_states:
+                selectors = (selectors_by_state or {}).get(state)
+                if selectors:
+                    remaining_ms = max(200, int((deadline - time.time()) * 1000))
+                    if wait_for_first_visible(page, selectors, timeout=min(remaining_ms, 800)):
+                        if settle_seconds:
+                            time.sleep(settle_seconds)
+                        return state
+                else:
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=1000)
+                    except Exception:
+                        pass
+                    if settle_seconds:
+                        time.sleep(settle_seconds)
+                    return state
         except Exception:
-            continue
+            pass
+        time.sleep(0.2)
+
+    trail = " -> ".join(seen_urls) if seen_urls else "(no navigable URL observed)"
+    raise RuntimeError(
+        f"Timed out waiting for route-ready state {list(expected_states)}. "
+        f"Current URL: {getattr(page, 'url', '(unknown)')}. Recent URLs: {trail}"
+    )
+
+
+def wait_for_first_visible(page, selectors: list[str], timeout: int = 15000) -> str | None:
+    """Return the first visible selector within a shared timeout budget."""
+    deadline = time.time() + (timeout / 1000)
+    while time.time() < deadline:
+        for selector in selectors:
+            try:
+                if page.locator(selector).first.is_visible():
+                    return selector
+            except Exception:
+                continue
+        time.sleep(0.2)
     return None
 
 
 def click_first_visible(page, selectors: list[str], timeout: int = 2000) -> str | None:
     """Click the first visible selector from the provided list."""
-    for selector in selectors:
-        try:
-            element = page.locator(selector).first
-            if element.is_visible(timeout=timeout):
-                element.click()
-                return selector
-        except Exception:
-            continue
-    return None
+    selector = wait_for_first_visible(page, selectors, timeout=timeout)
+    if not selector:
+        return None
+    try:
+        page.locator(selector).first.click()
+        return selector
+    except Exception:
+        return None
+
+
+def fill_first_visible(page, selectors: list[str], value: str, timeout: int = 3000) -> str | None:
+    """Fill the first visible input that matches the selector list."""
+    selector = wait_for_first_visible(page, selectors, timeout=timeout)
+    if not selector:
+        return None
+    try:
+        page.locator(selector).first.fill(value)
+        return selector
+    except Exception:
+        return None
 
 
 def wait_for_page_ready(
