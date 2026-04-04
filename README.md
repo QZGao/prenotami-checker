@@ -1,51 +1,40 @@
-# PrenotaMi Schengen Visa Checker + Manual Challenge Resume
+# PrenotaMi Schengen Visa Checker
 
-This checker monitors the Italian consulate's [PrenotaMi](https://prenotami.esteri.it/) appointment system for **Schengen visa** slots, attempts to auto-book when it thinks a slot is available, and sends Telegram alerts.
+Monitors the Italian consulate's [PrenotaMi](https://prenotami.esteri.it/) appointment system for **Schengen visa** slots, attempts to book when a slot appears, and sends Telegram alerts.
 
-The current flow is built for the Ubuntu/VNC setup discussed in this repo:
+## How It Works
 
-1. A single long-lived Playwright browser profile stays open.
-2. If PrenotaMi/Radware presents a bot challenge, the checker pauses instead of retrying.
-3. Telegram sends you the challenge screenshot plus your configured VNC/noVNC connection hint.
-4. You solve the challenge in that exact browser session.
-5. You send `/resume` in Telegram and the checker continues from the same profile.
-
-## Why This Refactor Exists
-
-PrenotaMi may redirect automated traffic to `validate.perfdrive.com` before the real site loads. Once that happens, a second browser instance is the wrong tool because cookies, challenge state, and login session belong to the original browser context.
-
-This refactor keeps one browser owner and turns Telegram into a control plane:
-
-- `/status`
-- `/screenshot`
-- `/pause`
-- `/resume`
-- `/help`
+1. Opens PrenotaMi in Chromium using [Playwright](https://playwright.dev/python/).
+2. Logs into your PrenotaMi account.
+3. Opens the Schengen visa **PRENOTA** flow.
+4. If appointments are exhausted, waits for the next check.
+5. If a slot appears, attempts to complete the booking form and submit it.
+6. If the site shows an anti-bot challenge, pauses and waits for you to solve it in the same browser session, then continues after `/resume` in Telegram.
 
 ## Prerequisites
 
 - **Python 3.10+**
 - A **PrenotaMi account**
 - A **Telegram bot token** and **chat ID**
-- A **desktop session on the server** if you want manual challenge solving
-  - VNC or noVNC is the intended model
-  - run with `BROWSER_HEADLESS=false`
+- A **desktop session** only if you want manual challenge solving
+  - for example VNC or noVNC
+  - use `BROWSER_HEADLESS=false`
 
 ## Setup
 
 ```bash
-git clone https://github.com/anglil/prenotami-checker.git
+git clone https://github.com/QZGao/prenotami-checker.git
 cd prenotami-checker
 
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python -m playwright install --with-deps chromium
+python -m playwright install chromium
 
 cp .env.example .env
 ```
 
-Edit `.env` with your credentials and VNC hint:
+Edit `.env`:
 
 ```bash
 PRENOTAMI_EMAIL=your-email@example.com
@@ -59,45 +48,16 @@ MANUAL_SOLVE_URL=https://your-server.example.com:6080/vnc.html
 MANUAL_SOLVE_NOTE=Open the VNC session, solve the challenge in the existing browser window, then send /resume on Telegram.
 TELEGRAM_POLL_TIMEOUT=15
 PLAYWRIGHT_NO_SANDBOX=false
-BROWSER_WIDTH=1280
-BROWSER_HEIGHT=800
-BROWSER_LOCALE=en-US
-BROWSER_TIMEZONE=America/Los_Angeles
-DEFAULT_TIMEOUT_MS=20000
 ```
 
-Additional optional browser/runtime config supported by code:
+Optional browser settings:
 
-- `BROWSER_WIDTH` and `BROWSER_HEIGHT` control the viewport size
-- `BROWSER_LOCALE` controls Playwright locale
-- `BROWSER_TIMEZONE` controls Playwright timezone
-- `BROWSER_USER_AGENT` overrides the default browser user agent
-- `DEFAULT_TIMEOUT_MS` controls the Playwright default timeout
-
-## Telegram Commands
-
-- `/status` shows current mode, URL, profile dir, and whether the checker is paused
-- `/screenshot` sends a fresh screenshot from the current browser page
-- `/pause` pauses the loop at the next safe point
-- `/resume` resumes after a pause or manual challenge solve
-- `/help` prints the command list
-
-## Manual Challenge Flow
-
-When the checker detects a bot challenge:
-
-1. It captures a screenshot and sends it to Telegram.
-2. It pauses the loop indefinitely.
-3. It keeps the same Playwright profile and browser session alive.
-4. You connect to that session through VNC/noVNC and solve the challenge.
-5. You send `/resume` in Telegram.
-6. The checker verifies the challenge is gone and restarts the check flow.
-
-Important constraints:
-
-- Only one checker process should own the browser profile at a time.
-- Do not start a second checker instance against the same `BROWSER_PROFILE_DIR`.
-- If you run with `BROWSER_HEADLESS=true`, Telegram pause/resume still works, but there may be no visible browser window to solve manually.
+- `BROWSER_WIDTH`
+- `BROWSER_HEIGHT`
+- `BROWSER_LOCALE`
+- `BROWSER_TIMEZONE`
+- `BROWSER_USER_AGENT`
+- `DEFAULT_TIMEOUT_MS`
 
 ## Usage
 
@@ -122,14 +82,26 @@ python checker.py --loop
 ./run_loop.sh
 ```
 
-The wrappers now look for `.venv/` first and fall back to `venv/`.
-`run_loop.sh` delegates to `python checker.py --loop` so `CHECK_INTERVAL` is respected by the Python runtime rather than duplicated in shell.
+## Telegram Commands
 
-## Ubuntu + systemd
+- `/status` shows the current mode and URL
+- `/screenshot` sends a fresh browser screenshot
+- `/pause` pauses the checker
+- `/resume` resumes after a pause or challenge solve
+- `/help` shows the command list
 
-Prefer running `checker.py --loop` directly under `systemd`, not `run_loop.sh`.
+## Ubuntu / VNC
 
-Example unit:
+If you want to solve challenges manually on a server:
+
+- run with `BROWSER_HEADLESS=false`
+- keep the browser profile stable with `BROWSER_PROFILE_DIR`
+- expose the same desktop session over VNC or noVNC
+- set `MANUAL_SOLVE_URL` so Telegram alerts include the connection link
+
+For `systemd`, run `checker.py --loop` directly and set `DISPLAY` if using a headed session.
+
+Example:
 
 ```ini
 [Unit]
@@ -142,31 +114,28 @@ Type=simple
 User=YOUR_LINUX_USER
 WorkingDirectory=/opt/prenotami-checker
 Environment=DISPLAY=:1
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/prenotami-checker/.venv/bin/python /opt/prenotami-checker/checker.py --loop
 Restart=always
 RestartSec=10
-Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Notes:
+## Notes
 
-- `DISPLAY=:1` is only an example; match your VNC/X server.
-- If your server user needs Chromium without sandbox, set `PLAYWRIGHT_NO_SANDBOX=true` in `.env`.
-- The browser profile is persisted in `BROWSER_PROFILE_DIR`, so keep that path stable across restarts.
+- Only one checker process should use a given `BROWSER_PROFILE_DIR`.
+- The checker keeps the browser session open between runs and reuses the current page when possible.
+- The booking payload in code is still applicant-specific. Update the hard-coded travel/applicant details before using it for someone else.
+- This repo currently targets the San Francisco consulate flow.
 
 ## Logs
 
-- Runtime logs: `logs/checker.log`
-- Notifications: `logs/notifications.log`
-- Challenge screenshots: `logs/*challenge*.png`
+- Runtime log: `logs/checker.log`
+- Notification log: `logs/notifications.log`
+- Screenshots: `logs/`
 - State snapshot: `.state.json`
-
-## Current Scope
-
-This repo still targets the San Francisco consulate and still contains the existing hard-coded booking details for the intended applicant. The refactor changed runtime/session handling, not the applicant-specific booking payload.
 
 ## License
 
