@@ -101,9 +101,22 @@ def check_page_for_all_booked(page) -> bool:
             return True
 
         modal_text = page.evaluate(
-            """() => Array.from(document.querySelectorAll('.modal, .modal-body, .swal2-popup, [role="dialog"]'))
+            """() => {
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    if (el.getAttribute('aria-hidden') === 'true') return false;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+                        return false;
+                    }
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+                return Array.from(document.querySelectorAll('.modal, .modal-body, .swal2-popup, [role="dialog"]'))
+                .filter((el) => isVisible(el))
                 .map((el) => (el.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase())
-                .join(' | ')"""
+                .join(' | ');
+            }"""
         )
         if any(indicator.lower() in modal_text for indicator in ALL_BOOKED_INDICATORS):
             return True

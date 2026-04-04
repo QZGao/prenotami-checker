@@ -865,9 +865,22 @@ class PrenotamiRunner:
         except Exception:
             pass
 
-    def handle_all_booked_state(self, page) -> None:
+    def reset_services_page(self, page, reason: str) -> BrowserObservation:
+        log.info("Reloading services page (%s)...", reason)
+        try:
+            page.goto("https://prenotami.esteri.it/Services", wait_until="domcontentloaded", timeout=30000)
+        except Exception as exc:
+            log.warning("Services reload failed during %s: %s", reason, exc)
+            self.dismiss_ok_button(page)
+        return self.wait_for_observation(
+            lambda current: current.state != PAGE_STATE_ALL_BOOKED,
+            timeout=8000,
+            probe_timeout=300,
+        )
+
+    def handle_all_booked_state(self, page) -> BrowserObservation:
         log.info("No slots available - all booked.")
-        self.dismiss_ok_button(page)
+        return self.reset_services_page(page, "all_booked_cleanup")
 
     def handle_autobook_result(self, result: str) -> None:
         log.info(f"Auto-book result: {result}")
@@ -958,22 +971,17 @@ class PrenotamiRunner:
 
         if observation.state == PAGE_STATE_ALL_BOOKED:
             if not context.prenota_clicked and not context.autobook_attempted:
-                attempt = context.record_attempt("dismiss_stale_all_booked")
+                attempt = context.record_attempt("refresh_stale_all_booked")
                 if attempt > 3:
                     raise RuntimeError(
-                        f"Stale all-booked popup did not clear after {attempt} attempts. "
+                        f"Stale all-booked popup did not clear after {attempt} services reload attempts. "
                         f"Current URL: {observation.url}"
                     )
-                log.info("Dismissing stale all-booked popup before a fresh PRENOTA attempt.")
-                self.handle_all_booked_state(page)
-                updated = self.wait_for_observation(
-                    lambda current: current.state != PAGE_STATE_ALL_BOOKED,
-                    timeout=5000,
-                    probe_timeout=300,
-                )
+                log.info("Reloading services page to clear stale all-booked popup before a fresh PRENOTA attempt.")
+                updated = self.reset_services_page(page, "stale_all_booked_before_prenota")
                 if updated.state == PAGE_STATE_ALL_BOOKED:
                     raise RuntimeError(
-                        f"All-booked popup remained visible after dismissal attempt. Current URL: {updated.url}"
+                        f"All-booked popup remained visible after services reload. Current URL: {updated.url}"
                     )
                 return "continue", None
 
