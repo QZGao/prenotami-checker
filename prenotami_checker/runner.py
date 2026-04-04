@@ -240,6 +240,9 @@ class PrenotamiRunner:
         if route != URL_STATE_PRENOTAMI:
             return PAGE_STATE_UNKNOWN
 
+        if check_page_for_all_booked(page):
+            return PAGE_STATE_BOOKING
+
         path = self._page_path(page)
         if path.startswith("/services"):
             return PAGE_STATE_SERVICES
@@ -248,9 +251,6 @@ class PrenotamiRunner:
 
         if wait_for_first_visible(page, LOGIN_LINK_SELECTORS, timeout=probe_timeout):
             return PAGE_STATE_HOME_LOGGED_OUT
-
-        if check_page_for_all_booked(page):
-            return PAGE_STATE_BOOKING
 
         if wait_for_first_visible(page, BOOKING_PAGE_SELECTORS, timeout=probe_timeout):
             return PAGE_STATE_BOOKING
@@ -337,7 +337,8 @@ class PrenotamiRunner:
                     const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim().toUpperCase();
                     const candidates = Array.from(document.querySelectorAll('a, button'));
                     for (const el of candidates) {
-                        if (normalize(el.textContent) === 'EN') {
+                        const label = normalize(el.textContent);
+                        if (label === 'EN' || label === 'ENG' || label === 'ENGLISH') {
                             el.click();
                             return true;
                         }
