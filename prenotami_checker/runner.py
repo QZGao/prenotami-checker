@@ -957,6 +957,26 @@ class PrenotamiRunner:
             return "continue", None
 
         if observation.state == PAGE_STATE_ALL_BOOKED:
+            if not context.prenota_clicked and not context.autobook_attempted:
+                attempt = context.record_attempt("dismiss_stale_all_booked")
+                if attempt > 3:
+                    raise RuntimeError(
+                        f"Stale all-booked popup did not clear after {attempt} attempts. "
+                        f"Current URL: {observation.url}"
+                    )
+                log.info("Dismissing stale all-booked popup before a fresh PRENOTA attempt.")
+                self.handle_all_booked_state(page)
+                updated = self.wait_for_observation(
+                    lambda current: current.state != PAGE_STATE_ALL_BOOKED,
+                    timeout=5000,
+                    probe_timeout=300,
+                )
+                if updated.state == PAGE_STATE_ALL_BOOKED:
+                    raise RuntimeError(
+                        f"All-booked popup remained visible after dismissal attempt. Current URL: {updated.url}"
+                    )
+                return "continue", None
+
             self.handle_all_booked_state(page)
             return "done", "no_slots"
 
@@ -1188,16 +1208,15 @@ class PrenotamiRunner:
         log.info("Authenticated page detected: %s (%s)", observation.state, observation.url)
 
     def open_schengen_booking_page(self) -> object:
-        observation, _ = self.drive_state_machine(
+        observation, detail = self.drive_state_machine(
             "booking",
             allow_autobook=False,
             terminal_predicate=lambda current: (
-                current.state == PAGE_STATE_ALL_BOOKED
-                or (current.state == PAGE_STATE_BOOKING and current.language != "it")
+                current.state == PAGE_STATE_BOOKING and current.language != "it"
             ),
             max_transitions=20,
         )
-        if observation.state == PAGE_STATE_ALL_BOOKED:
+        if detail == "no_slots" or observation.state == PAGE_STATE_ALL_BOOKED:
             log.info("Booking flow reached the all-booked popup/result page.")
             self.handle_all_booked_state(observation.page)
         else:
