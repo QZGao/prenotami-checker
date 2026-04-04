@@ -4,6 +4,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlparse
 
 from .exceptions import RestartLoop
 
@@ -22,8 +23,6 @@ ALL_BOOKED_INDICATORS = [
 
 BOT_CHALLENGE_INDICATORS = [
     "validate.perfdrive.com",
-    "botmanager_support@radware.com",
-    "access temporarily restricted",
 ]
 
 LOGIN_LINK_SELECTORS = [
@@ -60,6 +59,11 @@ LOGIN_SUBMIT_SELECTORS = [
     "button[type='submit']",
 ]
 
+URL_STATE_PRENOTAMI = "prenotami"
+URL_STATE_SSO = "sso"
+URL_STATE_CHALLENGE = "challenge"
+URL_STATE_UNKNOWN = "unknown"
+
 
 def check_page_for_all_booked(page) -> bool:
     """Check if the current page shows an 'all booked' message."""
@@ -70,26 +74,77 @@ def check_page_for_all_booked(page) -> bool:
         return False
 
 
+def classify_page_url(url: str) -> str:
+    """Classify the current browser URL into a small set of trusted route states."""
+    if not url:
+        return URL_STATE_UNKNOWN
+
+    try:
+        hostname = urlparse(url).netloc.lower()
+    except Exception:
+        return URL_STATE_UNKNOWN
+
+    if hostname.startswith("www."):
+        hostname = hostname[4:]
+
+    if hostname == "prenotami.esteri.it":
+        return URL_STATE_PRENOTAMI
+    if hostname == "iam.esteri.it":
+        return URL_STATE_SSO
+    if hostname == "validate.perfdrive.com":
+        return URL_STATE_CHALLENGE
+    return URL_STATE_UNKNOWN
+
+
 def detect_bot_challenge(page) -> str | None:
     """Return a short description when the page is a bot-challenge page."""
     try:
-        url = page.url.lower()
-        content = page.content().lower()
-        visible_text = page.evaluate("() => document.body ? document.body.innerText.toLowerCase() : ''")
+        url = page.url
     except Exception:
         return None
 
-    if "validate.perfdrive.com" in url:
-        return "validate.perfdrive.com"
-
-    if "iam.esteri.it/signin" in url or "iam.esteri.it/login" in url:
-        return None
-
-    haystacks = [content, visible_text]
-    for indicator in BOT_CHALLENGE_INDICATORS:
-        if any(indicator in haystack for haystack in haystacks):
-            return indicator
+    if classify_page_url(url) == URL_STATE_CHALLENGE:
+        for indicator in BOT_CHALLENGE_INDICATORS:
+            if indicator in url.lower():
+                return indicator
+        return url
     return None
+
+
+def wait_for_url_state(
+    page,
+    expected_states: list[str] | tuple[str, ...],
+    timeout: int = 30000,
+    settle_seconds: float = 1.0,
+) -> str:
+    """Wait until the page URL resolves to one of the expected route states."""
+    deadline = time.time() + (timeout / 1000)
+    seen_urls: list[str] = []
+
+    while time.time() < deadline:
+        try:
+            current_url = page.url
+            state = classify_page_url(current_url)
+            if current_url and (not seen_urls or seen_urls[-1] != current_url):
+                seen_urls.append(current_url)
+                if len(seen_urls) > 5:
+                    seen_urls = seen_urls[-5:]
+            if state in expected_states:
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=2000)
+                except Exception:
+                    pass
+                time.sleep(settle_seconds)
+                return state
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    trail = " -> ".join(seen_urls) if seen_urls else "(no navigable URL observed)"
+    raise RuntimeError(
+        f"Timed out waiting for URL state {list(expected_states)}. "
+        f"Current URL: {getattr(page, 'url', '(unknown)')}. Recent URLs: {trail}"
+    )
 
 
 def wait_for_first_visible(page, selectors: list[str], timeout: int = 15000) -> str | None:

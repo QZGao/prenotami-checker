@@ -19,11 +19,15 @@ from .prenotami import (
     LOGGED_IN_SELECTORS,
     PASSWORD_SELECTORS,
     USERNAME_SELECTORS,
+    URL_STATE_CHALLENGE,
+    URL_STATE_PRENOTAMI,
+    URL_STATE_SSO,
     attempt_auto_book,
     click_first_visible,
     detect_bot_challenge,
     wait_for_first_visible,
     wait_for_page_ready,
+    wait_for_url_state,
 )
 from .telegram_api import TelegramClient, write_notification_log
 
@@ -356,21 +360,45 @@ class PrenotamiRunner:
 
         log.info("Navigating to PrenotaMi...")
         page.goto("https://prenotami.esteri.it/", wait_until="domcontentloaded", timeout=60000)
-        wait_for_page_ready(page, selectors=LOGIN_LINK_SELECTORS + LOGGED_IN_SELECTORS + ["body"], timeout=20000, settle_seconds=2)
-        self.safe_point("homepage")
+        route = wait_for_url_state(
+            page,
+            expected_states=[URL_STATE_PRENOTAMI, URL_STATE_SSO, URL_STATE_CHALLENGE],
+            timeout=120000,
+            settle_seconds=2,
+        )
+        self.safe_point(f"landing:{route}")
 
-        if wait_for_first_visible(page, LOGGED_IN_SELECTORS, timeout=1500):
-            log.info("Existing authenticated session detected.")
-            return
+        if route == URL_STATE_PRENOTAMI:
+            wait_for_page_ready(
+                page,
+                selectors=LOGIN_LINK_SELECTORS + LOGGED_IN_SELECTORS + ["body"],
+                timeout=20000,
+                settle_seconds=2,
+            )
 
-        log.info("Clicking login...")
-        clicked = click_first_visible(page, LOGIN_LINK_SELECTORS, timeout=2000)
-        if not clicked:
-            shot = self.capture_page("homepage_not_ready")
-            raise RuntimeError(f"Homepage loaded but login link was not found at {page.url}. Screenshot: {shot}")
+            if wait_for_first_visible(page, LOGGED_IN_SELECTORS, timeout=1500):
+                log.info("Existing authenticated session detected.")
+                return
+
+            log.info("Clicking login from PrenotaMi homepage...")
+            clicked = click_first_visible(page, LOGIN_LINK_SELECTORS, timeout=4000)
+            if not clicked:
+                shot = self.capture_page("homepage_not_ready")
+                raise RuntimeError(f"Homepage loaded but login link was not found at {page.url}. Screenshot: {shot}")
+
+            route = wait_for_url_state(
+                page,
+                expected_states=[URL_STATE_SSO, URL_STATE_CHALLENGE],
+                timeout=30000,
+                settle_seconds=2,
+            )
+            self.safe_point(f"after-login-click:{route}")
+
+        if route != URL_STATE_SSO:
+            raise RuntimeError(f"Expected SSO login page but reached {page.url}")
 
         wait_for_page_ready(page, selectors=USERNAME_SELECTORS + PASSWORD_SELECTORS + ["body"], timeout=20000, settle_seconds=2)
-        self.safe_point("login-page")
+        self.safe_point("sso-login-page")
 
         username_filled = False
         for selector in USERNAME_SELECTORS:
@@ -402,18 +430,26 @@ class PrenotamiRunner:
         if not submit_clicked:
             raise RuntimeError("Login submit button was not found.")
 
-        wait_for_page_ready(page, selectors=LOGGED_IN_SELECTORS + LOGIN_LINK_SELECTORS + ["body"], timeout=30000, settle_seconds=3)
-        self.safe_point("post-login")
+        route = wait_for_url_state(
+            page,
+            expected_states=[URL_STATE_PRENOTAMI, URL_STATE_SSO, URL_STATE_CHALLENGE],
+            timeout=120000,
+            settle_seconds=3,
+        )
+        self.safe_point(f"post-login:{route}")
 
-        if wait_for_first_visible(page, LOGGED_IN_SELECTORS, timeout=1500):
-            log.info("Login successful!")
+        if route == URL_STATE_PRENOTAMI:
+            wait_for_page_ready(page, selectors=LOGGED_IN_SELECTORS + ["body"], timeout=20000, settle_seconds=2)
+            log.info("Login reached PrenotaMi.")
             return
 
         page_text = page.content().lower()
         if "login failure" in page_text or "login failed" in page_text:
             raise RuntimeError("Login failed.")
+        if route == URL_STATE_SSO:
+            raise RuntimeError(f"Login submit did not leave the SSO page. Current URL: {page.url}")
 
-        raise RuntimeError(f"Login did not reach an authenticated state. Current URL: {page.url}")
+        raise RuntimeError(f"Login did not reach a usable PrenotaMi state. Current URL: {page.url}")
 
     def click_schengen_prenota(self) -> bool:
         page = self.current_page(create=True)
@@ -482,8 +518,16 @@ class PrenotamiRunner:
 
         log.info("Navigating to services...")
         page.goto("https://prenotami.esteri.it/Services", wait_until="domcontentloaded", timeout=30000)
-        wait_for_page_ready(page, selectors=["tr", "table", "text=Schengen", "body"], timeout=15000, settle_seconds=2)
-        self.safe_point("services")
+        route = wait_for_url_state(
+            page,
+            expected_states=[URL_STATE_PRENOTAMI, URL_STATE_SSO, URL_STATE_CHALLENGE],
+            timeout=60000,
+            settle_seconds=2,
+        )
+        self.safe_point(f"services:{route}")
+        if route != URL_STATE_PRENOTAMI:
+            raise RuntimeError(f"Services navigation did not stay on PrenotaMi. Current URL: {page.url}")
+        wait_for_page_ready(page, selectors=["#advanced", "tr", "table", "text=Schengen", "body"], timeout=20000, settle_seconds=2)
 
         log.info("Clicking Schengen visa PRENOTA...")
         if not self.click_schengen_prenota():
