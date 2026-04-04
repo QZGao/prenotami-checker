@@ -28,6 +28,7 @@ from .prenotami import (
     click_first_visible,
     detect_bot_challenge,
     fill_first_visible,
+    is_booking_page,
     wait_for_first_visible,
     wait_for_page_ready,
 )
@@ -449,17 +450,24 @@ class PrenotamiRunner:
         self.focus_page(page)
         self.save_state("running", step="homepage")
 
-        log.info("Navigating to PrenotaMi...")
-        page.goto("https://prenotami.esteri.it/", wait_until="domcontentloaded", timeout=60000)
-        route, page = self.wait_for_route(
-            expected_states=[URL_STATE_PRENOTAMI, URL_STATE_SSO, URL_STATE_CHALLENGE],
-            timeout=120000,
-            settle_seconds=0.5,
-        )
+        route = classify_page_url(page.url)
+        if route == URL_STATE_UNKNOWN:
+            log.info("Navigating to PrenotaMi...")
+            page.goto("https://prenotami.esteri.it/", wait_until="domcontentloaded", timeout=60000)
+            route, page = self.wait_for_route(
+                expected_states=[URL_STATE_PRENOTAMI, URL_STATE_SSO, URL_STATE_CHALLENGE],
+                timeout=120000,
+                settle_seconds=0.5,
+            )
+        else:
+            log.info("Reusing current browser page for session check: %s", page.url)
         self.safe_point(f"landing:{route}")
         page = self.current_page(create=True)
 
         if route == URL_STATE_PRENOTAMI:
+            if is_booking_page(page):
+                log.info("Existing authenticated booking page detected.")
+                return
             wait_for_page_ready(
                 page,
                 selectors=LOGIN_LINK_SELECTORS + LOGGED_IN_SELECTORS + ["body"],
@@ -523,6 +531,73 @@ class PrenotamiRunner:
 
         raise RuntimeError(f"Login did not reach a usable PrenotaMi state. Current URL: {page.url}")
 
+    def open_schengen_booking_page(self) -> object:
+        for attempt in range(2):
+            page = self.current_page(create=True)
+            self.focus_page(page)
+
+            if is_booking_page(page):
+                log.info("Reusing existing booking page.")
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=30000)
+                except Exception as exc:
+                    log.warning(f"Booking page reload failed, continuing with existing page: {exc}")
+                route, page = self.wait_for_route(
+                    expected_states=[URL_STATE_PRENOTAMI, URL_STATE_SSO, URL_STATE_CHALLENGE],
+                    timeout=60000,
+                    settle_seconds=0.5,
+                )
+                self.safe_point(f"booking-page:{route}")
+                if route == URL_STATE_SSO:
+                    log.info("Session expired while reloading booking page. Re-authenticating.")
+                    self.ensure_logged_in()
+                    continue
+                if route != URL_STATE_PRENOTAMI:
+                    raise RuntimeError(f"Booking page reload did not stay on PrenotaMi. Current URL: {page.url}")
+                if not is_booking_page(page):
+                    log.info("Reloaded page is no longer the booking page. Reopening via services.")
+                    continue
+                return page
+
+            self.save_state("running", step="services")
+            log.info("Navigating to services...")
+            page.goto("https://prenotami.esteri.it/Services", wait_until="domcontentloaded", timeout=30000)
+            route, page = self.wait_for_route(
+                expected_states=[URL_STATE_PRENOTAMI, URL_STATE_SSO, URL_STATE_CHALLENGE],
+                timeout=60000,
+                settle_seconds=0.5,
+            )
+            self.safe_point(f"services:{route}")
+            if route == URL_STATE_SSO:
+                log.info("Services page redirected to login. Re-authenticating.")
+                self.ensure_logged_in()
+                continue
+            if route != URL_STATE_PRENOTAMI:
+                raise RuntimeError(f"Services navigation did not stay on PrenotaMi. Current URL: {page.url}")
+
+            wait_for_page_ready(page, selectors=["#advanced", "tr", "table", "text=Schengen", "body"], timeout=20000, settle_seconds=0.5)
+
+            log.info("Clicking Schengen visa PRENOTA...")
+            if not self.click_schengen_prenota():
+                raise RuntimeError("No Schengen PRENOTA button found")
+
+            log.info("Clicked PRENOTA for Schengen visa")
+            route, page = self.wait_for_route(
+                expected_states=[URL_STATE_PRENOTAMI, URL_STATE_SSO, URL_STATE_CHALLENGE],
+                timeout=60000,
+                settle_seconds=0.5,
+            )
+            self.safe_point(f"after-prenota-route:{route}")
+            if route == URL_STATE_SSO:
+                log.info("PRENOTA redirected to login. Re-authenticating.")
+                self.ensure_logged_in()
+                continue
+            if route != URL_STATE_PRENOTAMI:
+                raise RuntimeError(f"PRENOTA did not stay on PrenotaMi. Current URL: {page.url}")
+            return page
+
+        raise RuntimeError("Could not open the Schengen booking page after re-authentication attempts.")
+
     def click_schengen_prenota(self) -> bool:
         page = self.current_page(create=True)
         schengen_clicked = page.evaluate(
@@ -585,27 +660,7 @@ class PrenotamiRunner:
         self.ensure_logged_in()
         self.safe_point("after-login")
 
-        page = self.current_page(create=True)
-        self.focus_page(page)
-        self.save_state("running", step="services")
-
-        log.info("Navigating to services...")
-        page.goto("https://prenotami.esteri.it/Services", wait_until="domcontentloaded", timeout=30000)
-        route, page = self.wait_for_route(
-            expected_states=[URL_STATE_PRENOTAMI, URL_STATE_SSO, URL_STATE_CHALLENGE],
-            timeout=60000,
-            settle_seconds=0.5,
-        )
-        self.safe_point(f"services:{route}")
-        if route != URL_STATE_PRENOTAMI:
-            raise RuntimeError(f"Services navigation did not stay on PrenotaMi. Current URL: {page.url}")
-        wait_for_page_ready(page, selectors=["#advanced", "tr", "table", "text=Schengen", "body"], timeout=20000, settle_seconds=0.5)
-
-        log.info("Clicking Schengen visa PRENOTA...")
-        if not self.click_schengen_prenota():
-            raise RuntimeError("No Schengen PRENOTA button found")
-
-        log.info("Clicked PRENOTA for Schengen visa")
+        page = self.open_schengen_booking_page()
         time.sleep(6)
         self.safe_point("after-prenota")
 

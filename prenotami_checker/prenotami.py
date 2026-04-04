@@ -59,6 +59,22 @@ LOGIN_SUBMIT_SELECTORS = [
     "button[type='submit']",
 ]
 
+BOOKING_PAGE_SELECTORS = [
+    ".datepicker",
+    "td.day",
+    "td[data-action='selectDay']",
+    "select[name*='time']",
+    "select[name*='ora']",
+    ".time-slot",
+    "input[type='radio'][name*='time']",
+    "input[type='radio'][name*='ora']",
+    "button:has-text('Prenota')",
+    "button:has-text('Conferma')",
+    "button:has-text('Next')",
+    "input[type='submit']",
+    "textarea",
+]
+
 URL_STATE_PRENOTAMI = "prenotami"
 URL_STATE_SSO = "sso"
 URL_STATE_CHALLENGE = "challenge"
@@ -72,6 +88,19 @@ def check_page_for_all_booked(page) -> bool:
         return any(indicator in content for indicator in ALL_BOOKED_INDICATORS)
     except Exception:
         return False
+
+
+def is_booking_page(page) -> bool:
+    """Best-effort detection for the booking/calendar page after PRENOTA."""
+    try:
+        if classify_page_url(page.url) != URL_STATE_PRENOTAMI:
+            return False
+    except Exception:
+        return False
+
+    if check_page_for_all_booked(page):
+        return True
+    return bool(wait_for_first_visible(page, BOOKING_PAGE_SELECTORS, timeout=500))
 
 
 def classify_page_url(url: str) -> str:
