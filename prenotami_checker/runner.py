@@ -311,6 +311,18 @@ class PrenotamiRunner:
 
             time.sleep(0.2)
 
+        final_match = self._select_best_page(expected_states=expected, probe_timeout=probe_timeout)
+        if final_match:
+            state, page = final_match
+            log.warning(
+                "Page state %s reached at timeout boundary; continuing with %s",
+                state,
+                page.url,
+            )
+            if settle_seconds:
+                time.sleep(settle_seconds)
+            return state, page
+
         state, page = self.current_page_state(create=False, probe_timeout=probe_timeout)
         trail = " -> ".join(seen_states) if seen_states else "(no recognizable page state observed)"
         current_url = page.url if page else "(unknown)"
