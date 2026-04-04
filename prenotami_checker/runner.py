@@ -197,6 +197,13 @@ class PrenotamiRunner:
         if self.context:
             return
 
+        if not self.config.browser_headless and not self.current_display():
+            raise RuntimeError(
+                "BROWSER_HEADLESS=false requires a running X server and DISPLAY to be set. "
+                "Start the checker inside a VNC/noVNC desktop session and set DISPLAY=:N, "
+                "or set BROWSER_HEADLESS=true."
+            )
+
         self.playwright_manager = sync_playwright().start()
         launch_args: list[str] = []
         if self.config.playwright_no_sandbox:
