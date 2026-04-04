@@ -280,11 +280,15 @@ class PrenotamiRunner:
         )
 
     def ensure_english_language(self, page=None) -> bool:
-        page = page or self.current_page(create=False)
+        if page is None:
+            state, page = self.current_action_page("auth:language-switch")
+        else:
+            state = self.classify_page_state(page, probe_timeout=500)
+
         if not page:
             return False
 
-        if classify_page_url(page.url) != URL_STATE_PRENOTAMI:
+        if state not in AUTHENTICATED_PAGE_STATES and state != PAGE_STATE_PRENOTAMI_OTHER:
             return False
 
         try:
@@ -333,6 +337,53 @@ class PrenotamiRunner:
 
         log.info("SSO page changed to %s during %s (%s)", state, stage, page.url)
         return True
+
+    def current_action_page(self, stage: str, probe_timeout: int = 500) -> tuple[str, object]:
+        page = self.current_page(create=True)
+        state = self.classify_page_state(page, probe_timeout=probe_timeout)
+        if state == PAGE_STATE_CHALLENGE:
+            indicator = detect_bot_challenge(page) or page.url
+            self.pause_for_challenge(stage, indicator)
+            page = self.current_page(create=True)
+            state = self.classify_page_state(page, probe_timeout=probe_timeout)
+        return state, page
+
+    def click_visible_on_current_page(
+        self,
+        stage: str,
+        selectors: list[str],
+        timeout: int,
+        allowed_states: set[str] | None = None,
+    ) -> tuple[str | None, str, object]:
+        state, page = self.current_action_page(stage)
+        if allowed_states and state not in allowed_states:
+            return None, state, page
+
+        clicked = click_first_visible(page, selectors, timeout=timeout)
+        if clicked:
+            return clicked, state, page
+
+        state, page = self.current_action_page(f"{stage}:after-miss")
+        return None, state, page
+
+    def fill_visible_on_current_page(
+        self,
+        stage: str,
+        selectors: list[str],
+        value: str,
+        timeout: int,
+        allowed_states: set[str] | None = None,
+    ) -> tuple[str | None, str, object]:
+        state, page = self.current_action_page(stage)
+        if allowed_states and state not in allowed_states:
+            return None, state, page
+
+        filled = fill_first_visible(page, selectors, value, timeout=timeout)
+        if filled:
+            return filled, state, page
+
+        state, page = self.current_action_page(f"{stage}:after-miss")
+        return None, state, page
 
     def save_state(self, mode: str, **extra: object) -> None:
         page = self.current_page(create=False)
@@ -647,8 +698,16 @@ class PrenotamiRunner:
                     return
 
                 log.info("Clicking login from PrenotaMi homepage...")
-                clicked = click_first_visible(page, LOGIN_LINK_SELECTORS, timeout=4000)
+                clicked, live_state, live_page = self.click_visible_on_current_page(
+                    "auth:click-login",
+                    LOGIN_LINK_SELECTORS,
+                    timeout=4000,
+                    allowed_states={PAGE_STATE_HOME_LOGGED_OUT},
+                )
                 if not clicked:
+                    if live_state != PAGE_STATE_HOME_LOGGED_OUT:
+                        log.info("Login click skipped because page changed to %s (%s)", live_state, live_page.url)
+                        continue
                     shot = self.capture_page("homepage_not_ready")
                     raise RuntimeError(f"Homepage loaded but login link was not found at {page.url}. Screenshot: {shot}")
 
@@ -662,18 +721,43 @@ class PrenotamiRunner:
 
             if state == PAGE_STATE_SSO_LOGIN:
                 log.info("Submitting SSO login...")
-                if not fill_first_visible(page, USERNAME_SELECTORS, self.config.email, timeout=1000):
+                username_selector, live_state, _live_page = self.fill_visible_on_current_page(
+                    "auth:fill-username",
+                    USERNAME_SELECTORS,
+                    self.config.email,
+                    timeout=1000,
+                    allowed_states={PAGE_STATE_SSO_LOGIN},
+                )
+                if not username_selector:
+                    if live_state != PAGE_STATE_SSO_LOGIN:
+                        continue
                     if self._recover_from_sso_state_change("username lookup"):
                         continue
                     raise RuntimeError("Username input was not found on the login page.")
 
-                if not fill_first_visible(page, PASSWORD_SELECTORS, self.config.password, timeout=1000):
+                password_selector, live_state, _live_page = self.fill_visible_on_current_page(
+                    "auth:fill-password",
+                    PASSWORD_SELECTORS,
+                    self.config.password,
+                    timeout=1000,
+                    allowed_states={PAGE_STATE_SSO_LOGIN},
+                )
+                if not password_selector:
+                    if live_state != PAGE_STATE_SSO_LOGIN:
+                        continue
                     if self._recover_from_sso_state_change("password lookup"):
                         continue
                     raise RuntimeError("Password input was not found on the login page.")
 
-                submit_clicked = click_first_visible(page, LOGIN_SUBMIT_SELECTORS, timeout=2000)
+                submit_clicked, live_state, _live_page = self.click_visible_on_current_page(
+                    "auth:click-submit",
+                    LOGIN_SUBMIT_SELECTORS,
+                    timeout=2000,
+                    allowed_states={PAGE_STATE_SSO_LOGIN},
+                )
                 if not submit_clicked:
+                    if live_state != PAGE_STATE_SSO_LOGIN:
+                        continue
                     if self._recover_from_sso_state_change("submit lookup"):
                         continue
                     raise RuntimeError("Login submit button was not found.")
@@ -755,7 +839,11 @@ class PrenotamiRunner:
                     )
 
                 log.info("Clicking Schengen visa PRENOTA...")
-                if not self.click_schengen_prenota():
+                prenota_click = self.click_schengen_prenota()
+                if prenota_click == "state_changed":
+                    log.info("PRENOTA click skipped because the current page changed during the action.")
+                    continue
+                if prenota_click != "clicked":
                     raise RuntimeError("No Schengen PRENOTA button found")
 
                 self.wait_for_page_state(
@@ -790,8 +878,11 @@ class PrenotamiRunner:
             f"Current URL: {current_url}"
         )
 
-    def click_schengen_prenota(self) -> bool:
-        page = self.current_page(create=True)
+    def click_schengen_prenota(self) -> str:
+        state, page = self.current_action_page("booking:click-prenota")
+        if state != PAGE_STATE_SERVICES:
+            return "state_changed"
+
         schengen_clicked = page.evaluate(
             """() => {
                 const rows = document.querySelectorAll('tr');
@@ -812,32 +903,35 @@ class PrenotamiRunner:
             }"""
         )
         if schengen_clicked:
-            return True
+            return "clicked"
 
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         time.sleep(2)
 
-        return bool(
-            page.evaluate(
-                """() => {
-                    const rows = document.querySelectorAll('tr');
-                    for (const row of rows) {
-                        const text = row.textContent.toLowerCase();
-                        if (text.includes('schengen')) {
-                            const allLinks = row.querySelectorAll('a, button');
-                            for (const link of allLinks) {
-                                const label = link.textContent.trim().toUpperCase();
-                                if (label.includes('PRENOTA') || label.includes('BOOK')) {
-                                    link.click();
-                                    return true;
-                                }
+        state, page = self.current_action_page("booking:click-prenota-after-scroll")
+        if state != PAGE_STATE_SERVICES:
+            return "state_changed"
+
+        clicked_after_scroll = page.evaluate(
+            """() => {
+                const rows = document.querySelectorAll('tr');
+                for (const row of rows) {
+                    const text = row.textContent.toLowerCase();
+                    if (text.includes('schengen')) {
+                        const allLinks = row.querySelectorAll('a, button');
+                        for (const link of allLinks) {
+                            const label = link.textContent.trim().toUpperCase();
+                            if (label.includes('PRENOTA') || label.includes('BOOK')) {
+                                link.click();
+                                return true;
                             }
                         }
                     }
-                    return false;
-                }"""
-            )
+                }
+                return false;
+            }"""
         )
+        return "clicked" if clicked_after_scroll else "missing"
 
     def run_single_check(self) -> None:
         if is_already_booked(self.config.booked_file):
@@ -852,9 +946,14 @@ class PrenotamiRunner:
         self.ensure_logged_in()
         self.safe_point("after-login")
 
-        page = self.open_schengen_booking_page()
+        self.open_schengen_booking_page()
         time.sleep(6)
         self.safe_point("after-prenota")
+        booking_state, page = self.current_action_page("after-prenota-content")
+        if booking_state == PAGE_STATE_SERVICES:
+            raise RuntimeError("PRENOTA did not leave the services page.")
+        if booking_state == PAGE_STATE_HOME_LOGGED_OUT:
+            raise RuntimeError("Session returned to the logged-out homepage after PRENOTA.")
 
         page_content = page.content()
         page.screenshot(path=str(self.config.log_dir / "after_prenota.png"))
@@ -863,6 +962,11 @@ class PrenotamiRunner:
         if not is_all_booked:
             time.sleep(3)
             self.safe_point("after-prenota-second-check")
+            booking_state, page = self.current_action_page("after-prenota-second-content")
+            if booking_state == PAGE_STATE_SERVICES:
+                raise RuntimeError("PRENOTA returned to the services page before the second all-booked check.")
+            if booking_state == PAGE_STATE_HOME_LOGGED_OUT:
+                raise RuntimeError("Session returned to the logged-out homepage before the second all-booked check.")
             page_content = page.content()
             is_all_booked = any(indicator in page_content for indicator in ALL_BOOKED_INDICATORS)
 
