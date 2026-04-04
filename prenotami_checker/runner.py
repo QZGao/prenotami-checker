@@ -209,18 +209,29 @@ class PrenotamiRunner:
         if self.config.playwright_no_sandbox:
             launch_args.append("--no-sandbox")
 
-        self.context = self.playwright_manager.chromium.launch_persistent_context(
-            user_data_dir=str(self.config.browser_profile_dir),
-            headless=self.config.browser_headless,
-            user_agent=self.config.user_agent,
-            viewport={"width": self.config.browser_width, "height": self.config.browser_height},
-            locale=self.config.browser_locale,
-            timezone_id=self.config.browser_timezone,
-            args=launch_args,
-        )
-        self.context.set_default_timeout(self.config.default_timeout_ms)
-        self.page = self.current_page(create=True)
-        self.page.on("dialog", lambda dialog: dialog.accept())
+        try:
+            self.context = self.playwright_manager.chromium.launch_persistent_context(
+                user_data_dir=str(self.config.browser_profile_dir),
+                headless=self.config.browser_headless,
+                user_agent=self.config.user_agent,
+                viewport={"width": self.config.browser_width, "height": self.config.browser_height},
+                locale=self.config.browser_locale,
+                timezone_id=self.config.browser_timezone,
+                args=launch_args,
+            )
+            self.context.set_default_timeout(self.config.default_timeout_ms)
+            self.page = self.current_page(create=True)
+            self.page.on("dialog", lambda dialog: dialog.accept())
+        except Exception as exc:
+            self.close_browser()
+            raise RuntimeError(
+                "Chromium exited during startup. Common causes in headed mode are: "
+                "no usable desktop session for DISPLAY, missing XAUTHORITY/HOME in the "
+                "systemd unit, or a stale/locked browser profile. If VNC is running, try "
+                "setting HOME=/home/ubuntu and XAUTHORITY=/home/ubuntu/.Xauthority in the unit, "
+                "or test with a fresh BROWSER_PROFILE_DIR."
+            ) from exc
+
         self.save_state("running", message="Browser started")
         log.info(
             "Browser started with persistent profile %s (headless=%s)",
