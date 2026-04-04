@@ -78,6 +78,18 @@ PAGE_STATE_PRIORITY = {
     PAGE_STATE_UNKNOWN: 0,
 }
 
+ENGLISH_PAGE_MARKERS = [
+    "text=My appointments",
+    "text=Services provided by the office",
+    "text=Log out",
+]
+
+ITALIAN_PAGE_MARKERS = [
+    "text=I miei appuntamenti",
+    "text=Servizi erogati dalla sede",
+    "text=Disconnetti",
+]
+
 
 def is_already_booked(booked_file: Path) -> bool:
     return booked_file.exists()
@@ -331,6 +343,18 @@ class PrenotamiRunner:
             f"Current state: {state}. Current URL: {current_url}. Recent states: {trail}"
         )
 
+    def detect_page_language(self, page, probe_timeout: int = 500) -> str:
+        if not page:
+            return "unknown"
+        if classify_page_url(page.url) != URL_STATE_PRENOTAMI:
+            return "unknown"
+
+        if wait_for_first_visible(page, ENGLISH_PAGE_MARKERS, timeout=probe_timeout):
+            return "en"
+        if wait_for_first_visible(page, ITALIAN_PAGE_MARKERS, timeout=probe_timeout):
+            return "it"
+        return "unknown"
+
     def ensure_english_language(self, page=None) -> bool:
         if page is None:
             state, page = self.current_action_page("auth:language-switch")
@@ -342,6 +366,10 @@ class PrenotamiRunner:
 
         if state not in AUTHENTICATED_PAGE_STATES and state != PAGE_STATE_PRENOTAMI_OTHER:
             return False
+
+        current_language = self.detect_page_language(page, probe_timeout=400)
+        if current_language == "en":
+            return True
 
         try:
             clicked = page.evaluate(
@@ -380,7 +408,8 @@ class PrenotamiRunner:
             timeout=10000,
             settle_seconds=0.5,
         )
-        return True
+        page = self.current_page(create=True)
+        return self.detect_page_language(page, probe_timeout=800) != "it"
 
     def _recover_from_sso_state_change(self, stage: str) -> bool:
         page = self.current_page(create=True)
@@ -886,6 +915,13 @@ class PrenotamiRunner:
                 log.info("Booking flow encountered %s. Re-authenticating.", state)
                 self.ensure_logged_in()
                 continue
+
+            if state in {PAGE_STATE_AUTHENTICATED, PAGE_STATE_SERVICES, PAGE_STATE_BOOKING, PAGE_STATE_PRENOTAMI_OTHER}:
+                if self.detect_page_language(page, probe_timeout=300) != "en":
+                    switched = self.ensure_english_language(page)
+                    if switched:
+                        log.info("Switched PrenotaMi page to English during booking flow.")
+                        continue
 
             if state == PAGE_STATE_SERVICES:
                 wait_for_page_ready(page, selectors=SERVICES_PAGE_SELECTORS, timeout=20000, settle_seconds=0.5)
