@@ -1321,6 +1321,47 @@ class PrenotamiRunner:
 
         self.handle_autobook_result(detail)
 
+    def reset_to_homepage(self, reason: str) -> bool:
+        try:
+            self.ensure_browser()
+            observation = self.observe(create=True, probe_timeout=400)
+            page = observation.page or self.current_page(create=True)
+            if not page:
+                return False
+
+            log.info("Resetting browser to PrenotaMi homepage (%s)...", reason)
+            self.focus_page(page)
+            page.goto("https://prenotami.esteri.it/", wait_until="domcontentloaded", timeout=60000)
+            updated = self.wait_for_observation(
+                lambda current: current.url.startswith("https://prenotami.esteri.it/") or current.state == PAGE_STATE_CHALLENGE,
+                timeout=15000,
+                probe_timeout=300,
+            )
+            self.save_state(
+                "running",
+                step=f"recovered:{updated.state}",
+                recovery_reason=reason,
+                language=updated.language,
+            )
+            log.info("Recovery landed on %s (%s)", updated.state, updated.url)
+            return True
+        except Exception as exc:
+            log.warning("Homepage reset failed during %s: %s", reason, exc)
+            return False
+
+    def prepare_next_cycle_after_error(self, reason: str) -> bool:
+        if self.reset_to_homepage(reason):
+            return True
+
+        log.info("Homepage reset failed; restarting browser before next cycle...")
+        try:
+            self.restart_browser()
+        except Exception as exc:
+            log.warning("Browser restart during recovery failed: %s", exc)
+            return False
+
+        return self.reset_to_homepage(f"{reason}:after-restart")
+
     def sleep_with_command_polling(self, seconds: int) -> None:
         end_time = time.time() + seconds
         while time.time() < end_time and not self.stop_requested:
@@ -1363,6 +1404,27 @@ class PrenotamiRunner:
             except Exception as exc:
                 self.consecutive_errors += 1
                 log.error(f"Error ({self.consecutive_errors}): {exc}")
+                recovered = self.prepare_next_cycle_after_error(
+                    f"loop_error_{self.consecutive_errors}"
+                )
+
+                if recovered:
+                    log.info("Recovered browser state for the next cycle after error %s.", self.consecutive_errors)
+                else:
+                    log.warning("Could not recover browser state for the next cycle after error %s.", self.consecutive_errors)
+
+                if self.consecutive_errors < 3:
+                    self.save_state(
+                        "running",
+                        step="sleeping_after_recovery",
+                        recovery_reason=f"loop_error_{self.consecutive_errors}",
+                    )
+                    if self.stop_requested:
+                        break
+                    log.info(f"Next check in {self.config.check_interval // 60} minutes...")
+                    self.sleep_with_command_polling(self.config.check_interval)
+                    continue
+
                 shot = self.capture_page("error")
                 self.notify(
                     "PRENOTAMI: Checker Error",
@@ -1375,6 +1437,7 @@ class PrenotamiRunner:
                         f"Restarting the browser after {self.consecutive_errors} consecutive errors.",
                     )
                     self.restart_browser()
+                    self.prepare_next_cycle_after_error("post-error-threshold-restart")
                     self.consecutive_errors = 0
 
             if self.stop_requested:
