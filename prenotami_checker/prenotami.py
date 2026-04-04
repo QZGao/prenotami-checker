@@ -23,10 +23,7 @@ ALL_BOOKED_INDICATORS = [
 BOT_CHALLENGE_INDICATORS = [
     "validate.perfdrive.com",
     "botmanager_support@radware.com",
-    "radware",
-    "bot manager",
     "access temporarily restricted",
-    "captcha",
 ]
 
 LOGIN_LINK_SELECTORS = [
@@ -82,7 +79,13 @@ def detect_bot_challenge(page) -> str | None:
     except Exception:
         return None
 
-    haystacks = [url, content, visible_text]
+    if "validate.perfdrive.com" in url:
+        return "validate.perfdrive.com"
+
+    if "iam.esteri.it/signin" in url or "iam.esteri.it/login" in url:
+        return None
+
+    haystacks = [content, visible_text]
     for indicator in BOT_CHALLENGE_INDICATORS:
         if any(indicator in haystack for haystack in haystacks):
             return indicator
