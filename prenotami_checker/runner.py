@@ -430,24 +430,26 @@ class PrenotamiRunner:
         if not submit_clicked:
             raise RuntimeError("Login submit button was not found.")
 
-        route = wait_for_url_state(
-            page,
-            expected_states=[URL_STATE_PRENOTAMI, URL_STATE_SSO, URL_STATE_CHALLENGE],
-            timeout=120000,
-            settle_seconds=3,
-        )
+        try:
+            route = wait_for_url_state(
+                page,
+                expected_states=[URL_STATE_PRENOTAMI, URL_STATE_CHALLENGE],
+                timeout=120000,
+                settle_seconds=3,
+            )
+        except RuntimeError:
+            current_url = page.url
+            shot = self.capture_page("post_login_timeout")
+            raise RuntimeError(
+                "Login submit did not reach PrenotaMi or the challenge page within 120s. "
+                f"Current URL: {current_url}. Screenshot: {shot}"
+            )
         self.safe_point(f"post-login:{route}")
 
         if route == URL_STATE_PRENOTAMI:
             wait_for_page_ready(page, selectors=LOGGED_IN_SELECTORS + ["body"], timeout=20000, settle_seconds=2)
             log.info("Login reached PrenotaMi.")
             return
-
-        page_text = page.content().lower()
-        if "login failure" in page_text or "login failed" in page_text:
-            raise RuntimeError("Login failed.")
-        if route == URL_STATE_SSO:
-            raise RuntimeError(f"Login submit did not leave the SSO page. Current URL: {page.url}")
 
         raise RuntimeError(f"Login did not reach a usable PrenotaMi state. Current URL: {page.url}")
 
