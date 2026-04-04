@@ -13,6 +13,7 @@ log = logging.getLogger("prenotami")
 
 ALL_BOOKED_INDICATORS = [
     "All appointments for this service are currently booked",
+    "stante l'elevata richiesta i posti disponibili per il servizio scelto sono esauriti",
     "tutti gli appuntamenti",
     "currently booked",
     "attualmente esauriti",
@@ -90,8 +91,24 @@ URL_STATE_UNKNOWN = "unknown"
 def check_page_for_all_booked(page) -> bool:
     """Check if the current page shows an 'all booked' message."""
     try:
-        content = page.content()
-        return any(indicator in content for indicator in ALL_BOOKED_INDICATORS)
+        visible_text = page.evaluate(
+            """() => (document.body && document.body.innerText ? document.body.innerText : '')
+                .replace(/\\s+/g, ' ')
+                .trim()
+                .toLowerCase()"""
+        )
+        if any(indicator.lower() in visible_text for indicator in ALL_BOOKED_INDICATORS):
+            return True
+
+        modal_text = page.evaluate(
+            """() => Array.from(document.querySelectorAll('.modal, .modal-body, .swal2-popup, [role="dialog"]'))
+                .map((el) => (el.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase())
+                .join(' | ')"""
+        )
+        if any(indicator.lower() in modal_text for indicator in ALL_BOOKED_INDICATORS):
+            return True
+
+        return False
     except Exception:
         return False
 

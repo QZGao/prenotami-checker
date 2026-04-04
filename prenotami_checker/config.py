@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import sys
@@ -59,6 +60,7 @@ class Config:
     manual_solve_note: str
     telegram_poll_timeout: int
     default_timeout_ms: int
+    build_id: str
 
     def validate(self) -> None:
         required = {
@@ -87,6 +89,19 @@ def build_config() -> Config:
         os.environ.get("BROWSER_PROFILE_DIR", ".browser-profile"),
     )
     browser_profile_dir.mkdir(parents=True, exist_ok=True)
+
+    build_id = hashlib.sha256(
+        b"".join(
+            path.read_bytes()
+            for path in [
+                root_dir / "checker.py",
+                root_dir / "prenotami_checker" / "runner.py",
+                root_dir / "prenotami_checker" / "prenotami.py",
+                root_dir / "prenotami_checker" / "config.py",
+            ]
+            if path.exists()
+        )
+    ).hexdigest()[:12]
 
     return Config(
         root_dir=root_dir,
@@ -121,6 +136,7 @@ def build_config() -> Config:
         ),
         telegram_poll_timeout=int(os.environ.get("TELEGRAM_POLL_TIMEOUT", "15")),
         default_timeout_ms=int(os.environ.get("DEFAULT_TIMEOUT_MS", "20000")),
+        build_id=build_id,
     )
 
 

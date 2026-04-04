@@ -5,6 +5,7 @@ import logging
 import os
 import signal
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -14,7 +15,6 @@ from playwright.sync_api import sync_playwright
 from .config import Config
 from .exceptions import RestartLoop
 from .prenotami import (
-    ALL_BOOKED_INDICATORS,
     BOOKING_PAGE_SELECTORS,
     LOGIN_LINK_SELECTORS,
     LOGIN_SUBMIT_SELECTORS,
@@ -31,7 +31,6 @@ from .prenotami import (
     click_first_visible,
     detect_bot_challenge,
     fill_first_visible,
-    is_login_page,
     is_services_page,
     wait_for_first_visible,
     wait_for_page_ready,
@@ -47,6 +46,7 @@ PAGE_STATE_SSO_LOGIN = "sso_login"
 PAGE_STATE_HOME_LOGGED_OUT = "home_logged_out"
 PAGE_STATE_AUTHENTICATED = "authenticated"
 PAGE_STATE_SERVICES = "services"
+PAGE_STATE_ALL_BOOKED = "all_booked"
 PAGE_STATE_BOOKING = "booking"
 PAGE_STATE_PRENOTAMI_OTHER = "prenotami_other"
 PAGE_STATE_UNKNOWN = "unknown"
@@ -63,18 +63,20 @@ KNOWN_PAGE_STATES = {
     PAGE_STATE_HOME_LOGGED_OUT,
     PAGE_STATE_AUTHENTICATED,
     PAGE_STATE_SERVICES,
+    PAGE_STATE_ALL_BOOKED,
     PAGE_STATE_BOOKING,
     PAGE_STATE_PRENOTAMI_OTHER,
 }
 
 PAGE_STATE_PRIORITY = {
     PAGE_STATE_CHALLENGE: 70,
-    PAGE_STATE_BOOKING: 60,
-    PAGE_STATE_SERVICES: 50,
-    PAGE_STATE_AUTHENTICATED: 40,
-    PAGE_STATE_SSO_LOGIN: 30,
-    PAGE_STATE_HOME_LOGGED_OUT: 20,
-    PAGE_STATE_PRENOTAMI_OTHER: 10,
+    PAGE_STATE_ALL_BOOKED: 60,
+    PAGE_STATE_BOOKING: 50,
+    PAGE_STATE_SERVICES: 40,
+    PAGE_STATE_AUTHENTICATED: 30,
+    PAGE_STATE_SSO_LOGIN: 20,
+    PAGE_STATE_HOME_LOGGED_OUT: 10,
+    PAGE_STATE_PRENOTAMI_OTHER: 5,
     PAGE_STATE_UNKNOWN: 0,
 }
 
@@ -89,6 +91,42 @@ ITALIAN_PAGE_MARKERS = [
     "text=Servizi erogati dalla sede",
     "text=Disconnetti",
 ]
+
+
+@dataclass(slots=True)
+class BrowserObservation:
+    state: str
+    page: object | None
+    url: str
+    language: str
+
+
+@dataclass(slots=True)
+class CheckContext:
+    attempts: dict[str, int] = field(default_factory=dict)
+    history: list[str] = field(default_factory=list)
+    prenota_clicked: bool = False
+    autobook_attempted: bool = False
+    last_marker: str = ""
+
+    def begin_transition(self, observation: BrowserObservation) -> None:
+        marker = f"{observation.state}:{observation.url}"
+        if marker != self.last_marker:
+            self.last_marker = marker
+            self.attempts.clear()
+        self.history.append(marker)
+        if len(self.history) > 20:
+            self.history = self.history[-20:]
+
+    def record_attempt(self, name: str) -> int:
+        count = self.attempts.get(name, 0) + 1
+        self.attempts[name] = count
+        return count
+
+    def history_summary(self) -> str:
+        if not self.history:
+            return "(no observed states)"
+        return " -> ".join(self.history)
 
 
 def is_already_booked(booked_file: Path) -> bool:
@@ -194,6 +232,35 @@ class PrenotamiRunner:
             entries.append((index, state, page))
         return entries
 
+    def open_pages_snapshot(self, probe_timeout: int = 300) -> list[dict[str, object]]:
+        snapshot: list[dict[str, object]] = []
+        tracked = self.page
+        for index, state, page in self._enumerate_page_states(probe_timeout=probe_timeout):
+            try:
+                url = page.url
+            except Exception:
+                url = ""
+            snapshot.append(
+                {
+                    "index": index,
+                    "state": state,
+                    "url": url,
+                    "tracked": page is tracked,
+                }
+            )
+        return snapshot
+
+    def open_pages_summary(self, probe_timeout: int = 300) -> str:
+        pages = self.open_pages_snapshot(probe_timeout=probe_timeout)
+        if not pages:
+            return "(no open pages)"
+
+        parts: list[str] = []
+        for entry in pages:
+            marker = "*" if entry["tracked"] else "-"
+            parts.append(f"{marker}{entry['index']}:{entry['state']}:{entry['url']}")
+        return " | ".join(parts)
+
     def _select_best_page(
         self,
         expected_states: set[str] | None = None,
@@ -253,7 +320,7 @@ class PrenotamiRunner:
             return PAGE_STATE_UNKNOWN
 
         if check_page_for_all_booked(page):
-            return PAGE_STATE_BOOKING
+            return PAGE_STATE_ALL_BOOKED
 
         path = self._page_path(page)
         if path.startswith("/services"):
@@ -281,6 +348,48 @@ class PrenotamiRunner:
             return PAGE_STATE_UNKNOWN, None
         state = self.classify_page_state(page, probe_timeout=probe_timeout)
         return state, page
+
+    def observe(self, create: bool = True, probe_timeout: int = 400) -> BrowserObservation:
+        state, page = self.current_page_state(create=create, probe_timeout=probe_timeout)
+        url = page.url if page else ""
+        language = self.detect_page_language(page, probe_timeout=min(probe_timeout, 300)) if page else "unknown"
+        return BrowserObservation(
+            state=state,
+            page=page,
+            url=url,
+            language=language,
+        )
+
+    def wait_for_observation(
+        self,
+        predicate,
+        timeout: int = 5000,
+        probe_timeout: int = 300,
+    ) -> BrowserObservation:
+        deadline = time.time() + (timeout / 1000)
+        last = self.observe(create=True, probe_timeout=probe_timeout)
+        while time.time() < deadline:
+            last = self.observe(create=True, probe_timeout=probe_timeout)
+            if predicate(last):
+                return last
+            time.sleep(0.2)
+        return last
+
+    def wait_for_observation_change(
+        self,
+        previous: BrowserObservation,
+        timeout: int = 5000,
+        probe_timeout: int = 300,
+    ) -> BrowserObservation:
+        return self.wait_for_observation(
+            lambda current: (
+                current.state != previous.state
+                or current.url != previous.url
+                or current.language != previous.language
+            ),
+            timeout=timeout,
+            probe_timeout=probe_timeout,
+        )
 
     def wait_for_page_state(
         self,
@@ -371,6 +480,13 @@ class PrenotamiRunner:
         if current_language == "en":
             return True
 
+        before = BrowserObservation(
+            state=state,
+            page=page,
+            url=page.url,
+            language=current_language,
+        )
+
         try:
             clicked = page.evaluate(
                 """() => {
@@ -399,17 +515,16 @@ class PrenotamiRunner:
             page.wait_for_load_state("domcontentloaded", timeout=5000)
         except Exception:
             pass
-        time.sleep(0.5)
-
-        page = self.current_page(create=True)
-        wait_for_page_ready(
-            page,
-            selectors=LOGGED_IN_SELECTORS + SERVICES_PAGE_SELECTORS + BOOKING_PAGE_SELECTORS + ["body"],
-            timeout=10000,
-            settle_seconds=0.5,
+        updated = self.wait_for_observation(
+            lambda current: (
+                current.language == "en"
+                or current.state != before.state
+                or current.url != before.url
+            ),
+            timeout=8000,
+            probe_timeout=300,
         )
-        page = self.current_page(create=True)
-        return self.detect_page_language(page, probe_timeout=800) != "it"
+        return updated.language == "en"
 
     def _recover_from_sso_state_change(self, stage: str) -> bool:
         page = self.current_page(create=True)
@@ -481,10 +596,12 @@ class PrenotamiRunner:
             "mode": mode,
             "pause_reason": self.pause_reason,
             "check_count": self.check_count,
+            "build_id": self.config.build_id,
             "headless": self.config.browser_headless,
             "display": self.current_display(),
             "profile_dir": str(self.config.browser_profile_dir),
             "url": page.url if page else "",
+            "open_pages": self.open_pages_snapshot(probe_timeout=200),
             "updated_at": datetime.now().isoformat(),
         }
         state.update(extra)
@@ -516,6 +633,7 @@ class PrenotamiRunner:
         page = self.current_page(create=False)
         lines = [
             f"Mode: {self.mode}",
+            f"Build: {self.config.build_id}",
             f"Checks completed: {self.check_count}",
             f"Headless: {self.config.browser_headless}",
             f"Display: {self.current_display() or '(not set)'}",
@@ -526,6 +644,7 @@ class PrenotamiRunner:
             lines.append(f"Pause reason: {self.pause_reason}")
         if page:
             lines.append(f"Current URL: {page.url}")
+        lines.append(f"Open pages: {self.open_pages_summary(probe_timeout=200)}")
         if self.config.manual_solve_url:
             lines.append(f"Manual solve URL: {self.config.manual_solve_url}")
         self.telegram.send_message("\n".join(lines))
@@ -621,9 +740,10 @@ class PrenotamiRunner:
         self.save_state("running", message="Browser started")
         self.focus_page(self.page)
         log.info(
-            "Browser started with persistent profile %s (headless=%s)",
+            "Browser started with persistent profile %s (headless=%s, build=%s)",
             self.config.browser_profile_dir,
             self.config.browser_headless,
+            self.config.build_id,
         )
 
     def close_browser(self) -> None:
@@ -727,9 +847,9 @@ class PrenotamiRunner:
         self.wait_until_resumed(require_challenge_cleared=True)
 
     def safe_point(self, stage: str) -> None:
-        page = self.current_page(create=False)
-        if page:
-            indicator = detect_bot_challenge(page)
+        observation = self.observe(create=False, probe_timeout=300)
+        if observation.page:
+            indicator = detect_bot_challenge(observation.page)
             if indicator:
                 self.pause_for_challenge(stage, indicator)
 
@@ -737,348 +857,19 @@ class PrenotamiRunner:
         if self.pause_requested:
             self.pause_for_manual_request(stage)
 
-    def ensure_logged_in(self) -> None:
-        page = self.current_page(create=True)
-        self.focus_page(page)
-        login_transition_started = False
+    def dismiss_ok_button(self, page) -> None:
+        try:
+            ok_btn = page.locator("button:has-text('OK'), a:has-text('OK')").first
+            if ok_btn.is_visible(timeout=1500):
+                ok_btn.click()
+        except Exception:
+            pass
 
-        for transition in range(12):
-            state, page = self.current_page_state(create=True, probe_timeout=500)
-            self.save_state("running", step=f"auth:{state}")
-            self.safe_point(f"auth:{state}")
-            page = self.current_page(create=True)
-            state = self.classify_page_state(page, probe_timeout=500)
+    def handle_all_booked_state(self, page) -> None:
+        log.info("No slots available - all booked.")
+        self.dismiss_ok_button(page)
 
-            if state in AUTHENTICATED_PAGE_STATES:
-                if login_transition_started:
-                    self.ensure_english_language(page)
-                    self.safe_point("auth:after-language-switch")
-                    page = self.current_page(create=True)
-                    state = self.classify_page_state(page, probe_timeout=500)
-                    if state not in AUTHENTICATED_PAGE_STATES:
-                        continue
-                log.info("Authenticated page detected: %s (%s)", state, page.url)
-                return
-
-            if state == PAGE_STATE_CHALLENGE:
-                indicator = detect_bot_challenge(page) or page.url
-                self.pause_for_challenge("ensure_logged_in", indicator)
-
-            if state == PAGE_STATE_UNKNOWN:
-                log.info("Navigating to PrenotaMi...")
-                page.goto("https://prenotami.esteri.it/", wait_until="domcontentloaded", timeout=60000)
-                self.wait_for_page_state(timeout=120000, settle_seconds=0.5)
-                continue
-
-            if state == PAGE_STATE_PRENOTAMI_OTHER:
-                log.info("Unknown PrenotaMi page state at %s. Navigating to homepage.", page.url)
-                page.goto("https://prenotami.esteri.it/", wait_until="domcontentloaded", timeout=60000)
-                self.wait_for_page_state(timeout=60000, settle_seconds=0.5)
-                continue
-
-            if state == PAGE_STATE_HOME_LOGGED_OUT:
-                wait_for_page_ready(
-                    page,
-                    selectors=LOGIN_LINK_SELECTORS + LOGGED_IN_SELECTORS + ["body"],
-                    timeout=20000,
-                    settle_seconds=0.5,
-                )
-                if not is_login_page(page) and wait_for_first_visible(page, LOGGED_IN_SELECTORS, timeout=500):
-                    log.info("Existing authenticated session detected on PrenotaMi homepage.")
-                    return
-
-                log.info("Clicking login from PrenotaMi homepage...")
-                clicked, live_state, live_page = self.click_visible_on_current_page(
-                    "auth:click-login",
-                    LOGIN_LINK_SELECTORS,
-                    timeout=4000,
-                    allowed_states={PAGE_STATE_HOME_LOGGED_OUT},
-                )
-                if not clicked:
-                    if live_state != PAGE_STATE_HOME_LOGGED_OUT:
-                        log.info("Login click skipped because page changed to %s (%s)", live_state, live_page.url)
-                        continue
-                    shot = self.capture_page("homepage_not_ready")
-                    raise RuntimeError(f"Homepage loaded but login link was not found at {page.url}. Screenshot: {shot}")
-
-                login_transition_started = True
-                self.wait_for_page_state(
-                    expected_states=KNOWN_PAGE_STATES - {PAGE_STATE_HOME_LOGGED_OUT},
-                    timeout=30000,
-                    settle_seconds=0.0,
-                )
-                continue
-
-            if state == PAGE_STATE_SSO_LOGIN:
-                log.info("Submitting SSO login...")
-                username_selector, live_state, _live_page = self.fill_visible_on_current_page(
-                    "auth:fill-username",
-                    USERNAME_SELECTORS,
-                    self.config.email,
-                    timeout=1000,
-                    allowed_states={PAGE_STATE_SSO_LOGIN},
-                )
-                if not username_selector:
-                    if live_state != PAGE_STATE_SSO_LOGIN:
-                        continue
-                    if self._recover_from_sso_state_change("username lookup"):
-                        continue
-                    raise RuntimeError("Username input was not found on the login page.")
-
-                password_selector, live_state, _live_page = self.fill_visible_on_current_page(
-                    "auth:fill-password",
-                    PASSWORD_SELECTORS,
-                    self.config.password,
-                    timeout=1000,
-                    allowed_states={PAGE_STATE_SSO_LOGIN},
-                )
-                if not password_selector:
-                    if live_state != PAGE_STATE_SSO_LOGIN:
-                        continue
-                    if self._recover_from_sso_state_change("password lookup"):
-                        continue
-                    raise RuntimeError("Password input was not found on the login page.")
-
-                submit_clicked, live_state, _live_page = self.click_visible_on_current_page(
-                    "auth:click-submit",
-                    LOGIN_SUBMIT_SELECTORS,
-                    timeout=2000,
-                    allowed_states={PAGE_STATE_SSO_LOGIN},
-                )
-                if not submit_clicked:
-                    if live_state != PAGE_STATE_SSO_LOGIN:
-                        continue
-                    if self._recover_from_sso_state_change("submit lookup"):
-                        continue
-                    raise RuntimeError("Login submit button was not found.")
-
-                login_transition_started = True
-                try:
-                    self.wait_for_page_state(
-                        expected_states=KNOWN_PAGE_STATES - {PAGE_STATE_SSO_LOGIN},
-                        timeout=120000,
-                        settle_seconds=0.5,
-                    )
-                except RuntimeError:
-                    page = self.current_page(create=True)
-                    current_state = self.classify_page_state(page, probe_timeout=500)
-                    shot = self.capture_page("post_login_timeout")
-                    raise RuntimeError(
-                        "Login submit did not reach another recognized page state within 120s. "
-                        f"Current state: {current_state}. Current URL: {page.url}. Screenshot: {shot}"
-                    )
-                continue
-
-            raise RuntimeError(f"Unhandled authentication state {state} at {page.url}")
-
-        page = self.current_page(create=False)
-        current_url = page.url if page else "(unknown)"
-        raise RuntimeError(f"Authentication state machine did not settle after 12 transitions. Current URL: {current_url}")
-
-    def open_schengen_booking_page(self) -> object:
-        booking_reloaded = False
-
-        for transition in range(12):
-            state, page = self.current_page_state(create=True, probe_timeout=500)
-            self.focus_page(page)
-            self.save_state("running", step=f"booking:{state}")
-            self.safe_point(f"booking:{state}")
-            page = self.current_page(create=True)
-            state = self.classify_page_state(page, probe_timeout=500)
-
-            if state == PAGE_STATE_CHALLENGE:
-                indicator = detect_bot_challenge(page) or page.url
-                self.pause_for_challenge("open_schengen_booking_page", indicator)
-
-            if state == PAGE_STATE_BOOKING:
-                if booking_reloaded:
-                    log.info("Booking page ready.")
-                    return page
-
-                booking_reloaded = True
-                log.info("Reusing existing booking page.")
-                try:
-                    page.reload(wait_until="domcontentloaded", timeout=30000)
-                except Exception as exc:
-                    log.warning(f"Booking page reload failed, continuing with existing page: {exc}")
-
-                self.wait_for_page_state(
-                    expected_states=KNOWN_PAGE_STATES,
-                    timeout=60000,
-                    settle_seconds=0.5,
-                )
-                continue
-
-            booking_reloaded = False
-
-            if state in {PAGE_STATE_HOME_LOGGED_OUT, PAGE_STATE_SSO_LOGIN}:
-                log.info("Booking flow encountered %s. Re-authenticating.", state)
-                self.ensure_logged_in()
-                continue
-
-            if state in {PAGE_STATE_AUTHENTICATED, PAGE_STATE_SERVICES, PAGE_STATE_BOOKING, PAGE_STATE_PRENOTAMI_OTHER}:
-                if self.detect_page_language(page, probe_timeout=300) != "en":
-                    switched = self.ensure_english_language(page)
-                    if switched:
-                        log.info("Switched PrenotaMi page to English during booking flow.")
-                        continue
-
-            if state == PAGE_STATE_SERVICES:
-                wait_for_page_ready(page, selectors=SERVICES_PAGE_SELECTORS, timeout=20000, settle_seconds=0.5)
-                if is_login_page(page):
-                    log.info("Services request landed on the logged-out homepage. Re-authenticating.")
-                    self.ensure_logged_in()
-                    continue
-                if not is_services_page(page):
-                    shot = self.capture_page("services_not_ready")
-                    raise RuntimeError(
-                        f"Services page did not load the expected booking table. Current URL: {page.url}. Screenshot: {shot}"
-                    )
-
-                log.info("Clicking Schengen visa PRENOTA...")
-                prenota_click = self.click_schengen_prenota()
-                if prenota_click == "state_changed":
-                    log.info("PRENOTA click skipped because the current page changed during the action.")
-                    continue
-                if prenota_click != "clicked":
-                    raise RuntimeError("No Schengen PRENOTA button found")
-
-                self.wait_for_page_state(
-                    expected_states=KNOWN_PAGE_STATES - {PAGE_STATE_SERVICES},
-                    timeout=60000,
-                    settle_seconds=0.5,
-                )
-                continue
-
-            if state in {PAGE_STATE_AUTHENTICATED, PAGE_STATE_PRENOTAMI_OTHER}:
-                log.info("Navigating to services from %s...", page.url)
-                page.goto("https://prenotami.esteri.it/Services", wait_until="domcontentloaded", timeout=30000)
-                self.wait_for_page_state(
-                    expected_states=KNOWN_PAGE_STATES,
-                    timeout=60000,
-                    settle_seconds=0.5,
-                )
-                continue
-
-            if state == PAGE_STATE_UNKNOWN:
-                log.info("Unknown page while opening booking flow. Navigating to PrenotaMi homepage.")
-                page.goto("https://prenotami.esteri.it/", wait_until="domcontentloaded", timeout=60000)
-                self.wait_for_page_state(timeout=120000, settle_seconds=0.5)
-                continue
-
-            raise RuntimeError(f"Unhandled booking state {state} at {page.url}")
-
-        page = self.current_page(create=False)
-        current_url = page.url if page else "(unknown)"
-        raise RuntimeError(
-            "Could not reach the Schengen booking page after 12 state transitions. "
-            f"Current URL: {current_url}"
-        )
-
-    def click_schengen_prenota(self) -> str:
-        state, page = self.current_action_page("booking:click-prenota")
-        if state != PAGE_STATE_SERVICES:
-            return "state_changed"
-
-        schengen_clicked = page.evaluate(
-            """() => {
-                const rows = document.querySelectorAll('tr');
-                for (const row of rows) {
-                    const text = row.textContent.toLowerCase();
-                    if (text.includes('schengen')) {
-                        const allLinks = row.querySelectorAll('a, button');
-                        for (const link of allLinks) {
-                            const label = link.textContent.trim().toUpperCase();
-                            if (label.includes('PRENOTA') || label.includes('BOOK')) {
-                                link.click();
-                                return true;
-                            }
-                        }
-                    }
-                }
-                return false;
-            }"""
-        )
-        if schengen_clicked:
-            return "clicked"
-
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(2)
-
-        state, page = self.current_action_page("booking:click-prenota-after-scroll")
-        if state != PAGE_STATE_SERVICES:
-            return "state_changed"
-
-        clicked_after_scroll = page.evaluate(
-            """() => {
-                const rows = document.querySelectorAll('tr');
-                for (const row of rows) {
-                    const text = row.textContent.toLowerCase();
-                    if (text.includes('schengen')) {
-                        const allLinks = row.querySelectorAll('a, button');
-                        for (const link of allLinks) {
-                            const label = link.textContent.trim().toUpperCase();
-                            if (label.includes('PRENOTA') || label.includes('BOOK')) {
-                                link.click();
-                                return true;
-                            }
-                        }
-                    }
-                }
-                return false;
-            }"""
-        )
-        return "clicked" if clicked_after_scroll else "missing"
-
-    def run_single_check(self) -> None:
-        if is_already_booked(self.config.booked_file):
-            log.info("Already booked. Skipping check.")
-            self.stop_requested = True
-            return
-
-        self.ensure_browser()
-        self.safe_point("before-check")
-
-        log.info("Starting slot check...")
-        self.ensure_logged_in()
-        self.safe_point("after-login")
-
-        self.open_schengen_booking_page()
-        time.sleep(6)
-        self.safe_point("after-prenota")
-        booking_state, page = self.current_action_page("after-prenota-content")
-        if booking_state == PAGE_STATE_SERVICES:
-            raise RuntimeError("PRENOTA did not leave the services page.")
-        if booking_state == PAGE_STATE_HOME_LOGGED_OUT:
-            raise RuntimeError("Session returned to the logged-out homepage after PRENOTA.")
-
-        page_content = page.content()
-        page.screenshot(path=str(self.config.log_dir / "after_prenota.png"))
-        is_all_booked = any(indicator in page_content for indicator in ALL_BOOKED_INDICATORS)
-
-        if not is_all_booked:
-            time.sleep(3)
-            self.safe_point("after-prenota-second-check")
-            booking_state, page = self.current_action_page("after-prenota-second-content")
-            if booking_state == PAGE_STATE_SERVICES:
-                raise RuntimeError("PRENOTA returned to the services page before the second all-booked check.")
-            if booking_state == PAGE_STATE_HOME_LOGGED_OUT:
-                raise RuntimeError("Session returned to the logged-out homepage before the second all-booked check.")
-            page_content = page.content()
-            is_all_booked = any(indicator in page_content for indicator in ALL_BOOKED_INDICATORS)
-
-        if is_all_booked:
-            log.info("No slots available - all booked.")
-            try:
-                ok_btn = page.locator("button:has-text('OK'), a:has-text('OK')").first
-                if ok_btn.is_visible(timeout=2000):
-                    ok_btn.click()
-            except Exception:
-                pass
-            return
-
-        log.info("Slots detected. Attempting auto-book.")
-        result = attempt_auto_book(page, log_dir=self.config.log_dir, checkpoint=self.safe_point)
+    def handle_autobook_result(self, result: str) -> None:
         log.info(f"Auto-book result: {result}")
 
         travel_info = (
@@ -1115,6 +906,394 @@ class PrenotamiRunner:
         elif "BOOKING_MAYBE" in result.upper():
             log.info("Booking maybe confirmed. Will keep checking until strongly confirmed.")
 
+    def maybe_switch_to_english(self, observation: BrowserObservation, context: CheckContext) -> bool:
+        if observation.state not in {
+            PAGE_STATE_AUTHENTICATED,
+            PAGE_STATE_SERVICES,
+            PAGE_STATE_BOOKING,
+            PAGE_STATE_PRENOTAMI_OTHER,
+        }:
+            return False
+
+        if observation.language == "en":
+            return False
+
+        attempt = context.record_attempt("switch_language")
+        if observation.language == "it" and attempt > 3:
+            raise RuntimeError(
+                f"Failed to switch PrenotaMi to English after {attempt} attempts. "
+                f"Current URL: {observation.url}"
+            )
+
+        switched = self.ensure_english_language(observation.page)
+        if switched:
+            log.info("Switched PrenotaMi page to English.")
+            self.wait_for_observation(
+                lambda current: current.language == "en",
+                timeout=8000,
+                probe_timeout=300,
+            )
+            return True
+
+        if observation.language == "it":
+            raise RuntimeError(f"Could not switch PrenotaMi page to English at {observation.url}")
+
+        return False
+
+    def advance_check_state(
+        self,
+        observation: BrowserObservation,
+        context: CheckContext,
+        *,
+        allow_autobook: bool,
+    ) -> tuple[str, str | None]:
+        page = observation.page or self.current_page(create=True)
+        if not page:
+            raise RuntimeError("No active browser page is available.")
+
+        if observation.state == PAGE_STATE_CHALLENGE:
+            indicator = detect_bot_challenge(page) or observation.url
+            self.pause_for_challenge("check:challenge", indicator)
+            return "continue", None
+
+        if observation.state == PAGE_STATE_ALL_BOOKED:
+            self.handle_all_booked_state(page)
+            return "done", "no_slots"
+
+        if self.maybe_switch_to_english(observation, context):
+            return "continue", None
+
+        if observation.state == PAGE_STATE_UNKNOWN:
+            attempt = context.record_attempt("goto_home")
+            if attempt > 4:
+                raise RuntimeError(
+                    f"Unknown page state did not recover after {attempt} attempts. "
+                    f"Current URL: {observation.url}"
+                )
+            log.info("Unknown page state at %s. Navigating to PrenotaMi homepage.", observation.url or "(blank)")
+            page.goto("https://prenotami.esteri.it/", wait_until="domcontentloaded", timeout=60000)
+            self.wait_for_observation_change(observation, timeout=10000, probe_timeout=300)
+            return "continue", None
+
+        if observation.state == PAGE_STATE_PRENOTAMI_OTHER:
+            attempt = context.record_attempt("goto_services")
+            if attempt > 4:
+                raise RuntimeError(
+                    f"Could not stabilize unknown PrenotaMi page after {attempt} attempts. "
+                    f"Current URL: {observation.url}"
+                )
+            log.info("PrenotaMi page %s is not a terminal state. Navigating to services.", observation.url)
+            page.goto("https://prenotami.esteri.it/Services", wait_until="domcontentloaded", timeout=30000)
+            self.wait_for_observation_change(observation, timeout=10000, probe_timeout=300)
+            return "continue", None
+
+        if observation.state == PAGE_STATE_HOME_LOGGED_OUT:
+            wait_for_page_ready(
+                page,
+                selectors=LOGIN_LINK_SELECTORS + LOGGED_IN_SELECTORS + ["body"],
+                timeout=15000,
+                settle_seconds=0.0,
+            )
+            refreshed = self.observe(create=True, probe_timeout=400)
+            if refreshed.state != PAGE_STATE_HOME_LOGGED_OUT:
+                return "continue", None
+
+            attempt = context.record_attempt("click_login")
+            if attempt > 4:
+                raise RuntimeError(
+                    f"Homepage login click did not move the browser after {attempt} attempts. "
+                    f"Current URL: {refreshed.url}"
+                )
+
+            log.info("Clicking login from PrenotaMi homepage...")
+            clicked, live_state, live_page = self.click_visible_on_current_page(
+                "auth:click-login",
+                LOGIN_LINK_SELECTORS,
+                timeout=4000,
+                allowed_states={PAGE_STATE_HOME_LOGGED_OUT},
+            )
+            if not clicked:
+                if live_state != PAGE_STATE_HOME_LOGGED_OUT:
+                    log.info("Login click skipped because page changed to %s (%s)", live_state, live_page.url)
+                    return "continue", None
+                shot = self.capture_page("homepage_not_ready")
+                raise RuntimeError(f"Homepage loaded but login link was not found at {refreshed.url}. Screenshot: {shot}")
+
+            self.wait_for_observation_change(refreshed, timeout=15000, probe_timeout=300)
+            return "continue", None
+
+        if observation.state == PAGE_STATE_SSO_LOGIN:
+            attempt = context.record_attempt("submit_sso")
+            if attempt > 5:
+                raise RuntimeError(
+                    f"SSO sign-in page did not transition after {attempt} submit attempts. "
+                    f"Current URL: {observation.url}. Open pages: {self.open_pages_summary(probe_timeout=200)}"
+                )
+
+            log.info("Submitting SSO login...")
+            username_selector, live_state, _live_page = self.fill_visible_on_current_page(
+                "auth:fill-username",
+                USERNAME_SELECTORS,
+                self.config.email,
+                timeout=1000,
+                allowed_states={PAGE_STATE_SSO_LOGIN},
+            )
+            if not username_selector:
+                if live_state != PAGE_STATE_SSO_LOGIN:
+                    return "continue", None
+                if self._recover_from_sso_state_change("username lookup"):
+                    return "continue", None
+                raise RuntimeError("Username input was not found on the login page.")
+
+            password_selector, live_state, _live_page = self.fill_visible_on_current_page(
+                "auth:fill-password",
+                PASSWORD_SELECTORS,
+                self.config.password,
+                timeout=1000,
+                allowed_states={PAGE_STATE_SSO_LOGIN},
+            )
+            if not password_selector:
+                if live_state != PAGE_STATE_SSO_LOGIN:
+                    return "continue", None
+                if self._recover_from_sso_state_change("password lookup"):
+                    return "continue", None
+                raise RuntimeError("Password input was not found on the login page.")
+
+            submit_clicked, live_state, _live_page = self.click_visible_on_current_page(
+                "auth:click-submit",
+                LOGIN_SUBMIT_SELECTORS,
+                timeout=2000,
+                allowed_states={PAGE_STATE_SSO_LOGIN},
+            )
+            if not submit_clicked:
+                if live_state != PAGE_STATE_SSO_LOGIN:
+                    return "continue", None
+                if self._recover_from_sso_state_change("submit lookup"):
+                    return "continue", None
+                raise RuntimeError("Login submit button was not found.")
+
+            log.info("Open pages after SSO submit: %s", self.open_pages_summary(probe_timeout=200))
+            self.wait_for_observation_change(observation, timeout=15000, probe_timeout=300)
+            return "continue", None
+
+        if observation.state == PAGE_STATE_AUTHENTICATED:
+            attempt = context.record_attempt("goto_services")
+            if attempt > 4:
+                raise RuntimeError(
+                    f"Could not reach the services page after {attempt} attempts. "
+                    f"Current URL: {observation.url}"
+                )
+            log.info("Navigating to services from %s...", observation.url)
+            page.goto("https://prenotami.esteri.it/Services", wait_until="domcontentloaded", timeout=30000)
+            self.wait_for_observation_change(observation, timeout=10000, probe_timeout=300)
+            return "continue", None
+
+        if observation.state == PAGE_STATE_SERVICES:
+            wait_for_page_ready(page, selectors=SERVICES_PAGE_SELECTORS, timeout=15000, settle_seconds=0.0)
+            refreshed = self.observe(create=True, probe_timeout=400)
+            if refreshed.state != PAGE_STATE_SERVICES:
+                return "continue", None
+            if not is_services_page(refreshed.page):
+                shot = self.capture_page("services_not_ready")
+                raise RuntimeError(
+                    f"Services page did not load the expected booking table. Current URL: {refreshed.url}. Screenshot: {shot}"
+                )
+
+            attempt = context.record_attempt("click_prenota")
+            if attempt > 4:
+                raise RuntimeError(
+                    f"Schengen PRENOTA click did not leave the services page after {attempt} attempts. "
+                    f"Current URL: {refreshed.url}. Open pages: {self.open_pages_summary(probe_timeout=200)}"
+                )
+
+            log.info("Clicking Schengen visa PRENOTA...")
+            prenota_click = self.click_schengen_prenota(refreshed)
+            if prenota_click == "state_changed":
+                log.info("PRENOTA click skipped because the current page changed during the action.")
+                return "continue", None
+            if prenota_click != "clicked":
+                raise RuntimeError("No Schengen PRENOTA button found")
+
+            context.prenota_clicked = True
+            return "continue", None
+
+        if observation.state == PAGE_STATE_BOOKING:
+            if not allow_autobook:
+                return "done", "booking_page"
+            if context.autobook_attempted:
+                raise RuntimeError(
+                    f"Booking page persisted after a booking attempt. Current URL: {observation.url}. "
+                    f"Open pages: {self.open_pages_summary(probe_timeout=200)}"
+                )
+            context.autobook_attempted = True
+            log.info("Slots detected. Attempting auto-book.")
+            result = attempt_auto_book(page, log_dir=self.config.log_dir, checkpoint=self.safe_point)
+            return "autobook", result
+
+        raise RuntimeError(f"Unhandled check state {observation.state} at {observation.url}")
+
+    def drive_state_machine(
+        self,
+        stage: str,
+        *,
+        allow_autobook: bool,
+        terminal_predicate=None,
+        max_transitions: int = 30,
+    ) -> tuple[BrowserObservation, str | None]:
+        context = CheckContext()
+        last_observation = self.observe(create=True, probe_timeout=500)
+
+        for transition in range(1, max_transitions + 1):
+            observation = self.observe(create=True, probe_timeout=500)
+            context.begin_transition(observation)
+            self.save_state(
+                "running",
+                step=f"{stage}:{transition}:{observation.state}",
+                language=observation.language,
+                history=context.history[-8:],
+            )
+            self.safe_point(f"{stage}:{observation.state}")
+            observation = self.observe(create=True, probe_timeout=500)
+            context.begin_transition(observation)
+            last_observation = observation
+
+            if terminal_predicate and terminal_predicate(observation):
+                return observation, None
+
+            outcome, detail = self.advance_check_state(
+                observation,
+                context,
+                allow_autobook=allow_autobook,
+            )
+            if outcome in {"done", "autobook"}:
+                return observation, detail
+
+        raise RuntimeError(
+            f"{stage} state machine did not settle after {max_transitions} transitions. "
+            f"Current state: {last_observation.state}. "
+            f"Current URL: {last_observation.url}. "
+            f"History: {context.history_summary()}. "
+            f"Open pages: {self.open_pages_summary(probe_timeout=200)}"
+        )
+
+    def ensure_logged_in(self) -> None:
+        observation, _ = self.drive_state_machine(
+            "auth",
+            allow_autobook=False,
+            terminal_predicate=lambda current: (
+                current.state in AUTHENTICATED_PAGE_STATES and current.language != "it"
+            ),
+            max_transitions=20,
+        )
+        log.info("Authenticated page detected: %s (%s)", observation.state, observation.url)
+
+    def open_schengen_booking_page(self) -> object:
+        observation, _ = self.drive_state_machine(
+            "booking",
+            allow_autobook=False,
+            terminal_predicate=lambda current: (
+                current.state == PAGE_STATE_ALL_BOOKED
+                or (current.state == PAGE_STATE_BOOKING and current.language != "it")
+            ),
+            max_transitions=20,
+        )
+        if observation.state == PAGE_STATE_ALL_BOOKED:
+            log.info("Booking flow reached the all-booked popup/result page.")
+            self.handle_all_booked_state(observation.page)
+        else:
+            log.info("Booking page ready.")
+        return observation.page
+
+    def click_schengen_prenota(self, observation: BrowserObservation | None = None) -> str:
+        if observation is None:
+            observation = self.observe(create=True, probe_timeout=500)
+
+        state, page = self.current_action_page("booking:click-prenota")
+        if state != PAGE_STATE_SERVICES:
+            return "state_changed"
+
+        before = BrowserObservation(
+            state=state,
+            page=page,
+            url=page.url,
+            language=self.detect_page_language(page, probe_timeout=300),
+        )
+
+        schengen_clicked = page.evaluate(
+            """() => {
+                const rows = document.querySelectorAll('tr');
+                for (const row of rows) {
+                    const text = row.textContent.toLowerCase();
+                    if (text.includes('schengen')) {
+                        const allLinks = row.querySelectorAll('a, button');
+                        for (const link of allLinks) {
+                            const label = link.textContent.trim().toUpperCase();
+                            if (label.includes('PRENOTA') || label.includes('BOOK')) {
+                                link.click();
+                                return true;
+                            }
+                        }
+                    }
+                }
+                return false;
+            }"""
+        )
+        if schengen_clicked:
+            self.wait_for_observation_change(before, timeout=10000, probe_timeout=300)
+            return "clicked"
+
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+
+        state, page = self.current_action_page("booking:click-prenota-after-scroll")
+        if state != PAGE_STATE_SERVICES:
+            return "state_changed"
+
+        clicked_after_scroll = page.evaluate(
+            """() => {
+                const rows = document.querySelectorAll('tr');
+                for (const row of rows) {
+                    const text = row.textContent.toLowerCase();
+                    if (text.includes('schengen')) {
+                        const allLinks = row.querySelectorAll('a, button');
+                        for (const link of allLinks) {
+                            const label = link.textContent.trim().toUpperCase();
+                            if (label.includes('PRENOTA') || label.includes('BOOK')) {
+                                link.click();
+                                return true;
+                            }
+                        }
+                    }
+                }
+                return false;
+            }"""
+        )
+        if clicked_after_scroll:
+            self.wait_for_observation_change(before, timeout=10000, probe_timeout=300)
+            return "clicked"
+        return "missing"
+
+    def run_single_check(self) -> None:
+        if is_already_booked(self.config.booked_file):
+            log.info("Already booked. Skipping check.")
+            self.stop_requested = True
+            return
+
+        self.ensure_browser()
+        self.safe_point("before-check")
+
+        log.info("Starting slot check...")
+        _observation, detail = self.drive_state_machine(
+            "check",
+            allow_autobook=True,
+            terminal_predicate=None,
+            max_transitions=30,
+        )
+
+        if detail in {None, "no_slots", "booking_page"}:
+            return
+
+        self.handle_autobook_result(detail)
+
     def sleep_with_command_polling(self, seconds: int) -> None:
         end_time = time.time() + seconds
         while time.time() < end_time and not self.stop_requested:
@@ -1126,6 +1305,7 @@ class PrenotamiRunner:
     def announce_start(self) -> None:
         lines = [
             f"PrenotaMi checker started. Interval: {self.config.check_interval}s",
+            f"Build: {self.config.build_id}",
             f"Headless: {self.config.browser_headless}",
             f"Display: {self.current_display() or '(not set)'}",
             f"Profile: {self.config.browser_profile_dir}",
