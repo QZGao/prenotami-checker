@@ -34,9 +34,15 @@ LOGIN_LINK_SELECTORS = [
 
 LOGGED_IN_SELECTORS = [
     "a[href*='Logout']",
-    "a[href*='Services']",
     "text=I miei appuntamenti",
     "text=My appointments",
+]
+
+SERVICES_PAGE_SELECTORS = [
+    "#advanced",
+    "#dataTableServices",
+    "text=Schengen",
+    "table tbody tr",
 ]
 
 USERNAME_SELECTORS = [
@@ -101,6 +107,21 @@ def is_booking_page(page) -> bool:
     if check_page_for_all_booked(page):
         return True
     return bool(wait_for_first_visible(page, BOOKING_PAGE_SELECTORS, timeout=500))
+
+
+def is_login_page(page) -> bool:
+    """Detect the logged-out homepage/login prompt."""
+    return bool(wait_for_first_visible(page, LOGIN_LINK_SELECTORS, timeout=500))
+
+
+def is_services_page(page) -> bool:
+    """Detect the services listing page for an authenticated session."""
+    try:
+        if classify_page_url(page.url) != URL_STATE_PRENOTAMI:
+            return False
+    except Exception:
+        return False
+    return bool(wait_for_first_visible(page, SERVICES_PAGE_SELECTORS, timeout=800))
 
 
 def classify_page_url(url: str) -> str:

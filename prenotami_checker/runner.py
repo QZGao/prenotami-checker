@@ -18,6 +18,7 @@ from .prenotami import (
     LOGIN_SUBMIT_SELECTORS,
     LOGGED_IN_SELECTORS,
     PASSWORD_SELECTORS,
+    SERVICES_PAGE_SELECTORS,
     USERNAME_SELECTORS,
     URL_STATE_CHALLENGE,
     URL_STATE_PRENOTAMI,
@@ -29,6 +30,8 @@ from .prenotami import (
     detect_bot_challenge,
     fill_first_visible,
     is_booking_page,
+    is_login_page,
+    is_services_page,
     wait_for_first_visible,
     wait_for_page_ready,
 )
@@ -468,6 +471,11 @@ class PrenotamiRunner:
             if is_booking_page(page):
                 log.info("Existing authenticated booking page detected.")
                 return
+            if is_login_page(page):
+                log.info("Current PrenotaMi page is the logged-out homepage.")
+            elif is_services_page(page):
+                log.info("Existing authenticated services page detected.")
+                return
             wait_for_page_ready(
                 page,
                 selectors=LOGIN_LINK_SELECTORS + LOGGED_IN_SELECTORS + ["body"],
@@ -475,7 +483,7 @@ class PrenotamiRunner:
                 settle_seconds=0.5,
             )
 
-            if wait_for_first_visible(page, LOGGED_IN_SELECTORS, timeout=500):
+            if not is_login_page(page) and wait_for_first_visible(page, LOGGED_IN_SELECTORS, timeout=500):
                 log.info("Existing authenticated session detected.")
                 return
 
@@ -575,7 +583,16 @@ class PrenotamiRunner:
             if route != URL_STATE_PRENOTAMI:
                 raise RuntimeError(f"Services navigation did not stay on PrenotaMi. Current URL: {page.url}")
 
-            wait_for_page_ready(page, selectors=["#advanced", "tr", "table", "text=Schengen", "body"], timeout=20000, settle_seconds=0.5)
+            wait_for_page_ready(page, selectors=SERVICES_PAGE_SELECTORS, timeout=20000, settle_seconds=0.5)
+            if is_login_page(page):
+                log.info("Services request landed on the logged-out homepage. Re-authenticating.")
+                self.ensure_logged_in()
+                continue
+            if not is_services_page(page):
+                shot = self.capture_page("services_not_ready")
+                raise RuntimeError(
+                    f"Services page did not load the expected booking table. Current URL: {page.url}. Screenshot: {shot}"
+                )
 
             log.info("Clicking Schengen visa PRENOTA...")
             if not self.click_schengen_prenota():
